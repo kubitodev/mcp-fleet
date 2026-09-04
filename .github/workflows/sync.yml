@@ -7,6 +7,9 @@ name: sync
 on:
   schedule:
     - cron: "17 4 * * 1" # Mondays 04:17 UTC
+  push:
+    branches: [main]
+    paths: ["mcps/**"] # first-party MCP source changed → rebuild it
   workflow_dispatch:
     inputs:
       force_build:
@@ -50,7 +53,12 @@ jobs:
       - name: Plan builds (changed, or all when forced)
         id: plan
         run: |
-          all=$(yq -o=json -I=0 '[.mcps[] | select(.build == true) | {"name": .name, "ref": .ref, "context": ("vendor/" + .name), "dockerfile": (.dockerfile // ("vendor/" + .name + "/Dockerfile"))}]' fleet.yaml)
+          # a push to mcps/** rebuilds every first-party MCP (vendor-sync never
+          # lists them in .changed); few of them, so no per-dir diffing needed
+          if [ "${{ github.event_name }}" = "push" ]; then
+            yq -r '.mcps[] | select(.build == true and .local == true) | .name' fleet.yaml >> .changed
+          fi
+          all=$(yq -o=json -I=0 '[.mcps[] | select(.build == true) | {"name": .name, "ref": .ref, "context": (.context // ("vendor/" + .name)), "dockerfile": (.dockerfile // ("vendor/" + .name + "/Dockerfile"))}]' fleet.yaml)
           if [ "${{ inputs.force_build }}" = "true" ]; then
             sel="$all"
           else

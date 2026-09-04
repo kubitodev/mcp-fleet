@@ -10,6 +10,10 @@ cd "$(dirname "$0")/.."
 count=$(yq '.mcps | length' fleet.yaml)
 for i in $(seq 0 $((count - 1))); do
   name=$(yq -r ".mcps[$i].name" fleet.yaml)
+  # first-party MCPs (source in-repo under mcps/) have no upstream to vendor
+  if [ "$(yq -r ".mcps[$i].local // false" fleet.yaml)" = "true" ]; then
+    echo "== $name: first-party (in-repo under mcps/), not vendored"; continue
+  fi
   upstream=$(yq -r ".mcps[$i].upstream" fleet.yaml)
   pin=$(yq -r ".mcps[$i].pin // \"\"" fleet.yaml)
   cur=$(yq -r ".mcps[$i].ref" fleet.yaml)

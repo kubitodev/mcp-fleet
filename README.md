@@ -43,11 +43,29 @@ Edit `fleet.yaml`:
 
 Then run the `sync` workflow (or wait for the weekly run).
 
+### First-party MCPs (no upstream)
+
+Some MCPs don't exist upstream at all — we write them here. Put the source under
+`mcps/<name>/` (with its own `Dockerfile`) and add a `local: true` entry:
+
+```yaml
+- name: something-mcp
+  local: true                 # source in-repo under mcps/ (vendor-sync skips it)
+  ref: v0.1.0                 # hand-bumped; tag when the source changes
+  build: true
+  context: mcps/something-mcp
+  dockerfile: mcps/something-mcp/Dockerfile
+```
+
+A push touching `mcps/**` rebuilds the changed first-party image. Bump `ref` when
+you cut a new version.
+
 ## Layout
 
 ```
 fleet.yaml                     # the manifest (source of truth)
 vendor/<name>/                 # mirrored upstream source (committed archive)
+mcps/<name>/                   # first-party MCP source we author (local: true)
 dockerfiles/<name>.Dockerfile  # for build:true MCPs whose upstream ships no Dockerfile
 scripts/sync.sh                # vendoring logic (skips unchanged; writes .changed)
 .github/workflows/             # sync.yml (vendor + build), renovate.yml
