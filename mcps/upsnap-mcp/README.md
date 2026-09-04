@@ -26,7 +26,7 @@ Power:
 | `UPSNAP_URL` | yes | | UpSnap base URL, e.g. `http://upsnap:8090` |
 | `UPSNAP_MCP_USER` | yes | | PocketBase identity (email/username) |
 | `UPSNAP_MCP_PASSWORD` | yes | | its password |
-| `UPSNAP_MCP_AUTH_COLLECTION` | no | `users` | set `_superusers` if the account is a superuser |
+| `UPSNAP_MCP_AUTH_COLLECTION` | no | (auto) | pin one collection; unset mirrors UpSnap's login (tries `_superusers`, then `users`) |
 | `UPSNAP_MCP_AUTH_TOKEN` | no | | shared bearer guarding `/mcp` (strongly recommended) |
 | `UPSNAP_MCP_READ_ONLY` | no | `false` | `true` drops all power tools |
 | `UPSNAP_MCP_HTTP_ADDR` | no | `:8080` | listen address |

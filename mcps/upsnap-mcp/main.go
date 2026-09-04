@@ -28,16 +28,23 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
-const version = "0.1.0"
+const version = "0.1.1"
 
 func main() {
 	base := strings.TrimRight(mustEnv("UPSNAP_URL"), "/")
 	c := &Client{
-		base:     base,
-		http:     &http.Client{Timeout: 20 * time.Second},
-		authColl: envOr("UPSNAP_MCP_AUTH_COLLECTION", "users"),
-		user:     mustEnv("UPSNAP_MCP_USER"),
-		pass:     mustEnv("UPSNAP_MCP_PASSWORD"),
+		base: base,
+		http: &http.Client{Timeout: 20 * time.Second},
+		user: mustEnv("UPSNAP_MCP_USER"),
+		pass: mustEnv("UPSNAP_MCP_PASSWORD"),
+	}
+	// Which PocketBase collection to auth against. If unset, mirror UpSnap's own
+	// login (login/+page.svelte): try _superusers, then users — so the MCP works
+	// with either kind of account without the operator needing to know which.
+	if col := os.Getenv("UPSNAP_MCP_AUTH_COLLECTION"); col != "" {
+		c.authColls = []string{col}
+	} else {
+		c.authColls = []string{"_superusers", "users"}
 	}
 	endpointToken := os.Getenv("UPSNAP_MCP_AUTH_TOKEN")
 	if endpointToken == "" {
@@ -96,47 +103,68 @@ func bearerAuth(token string, next http.Handler) http.Handler {
 // ── UpSnap / PocketBase client ──────────────────────────────────────────────
 
 type Client struct {
-	base     string
-	http     *http.Client
-	authColl string
-	user     string
-	pass     string
+	base string
+	http *http.Client
+	user string
+	pass string
 
-	mu    sync.Mutex
-	token string
+	mu        sync.Mutex
+	token     string
+	authColls []string // candidate collections; the one that works is pinned first
 }
 
-// authenticate logs in with identity+password and caches the JWT.
+// authenticate logs in and caches the JWT, trying each candidate collection in
+// order (mirrors UpSnap's login: _superusers then users). The winning collection
+// is moved to the front so later re-auths hit it first.
 func (c *Client) authenticate(ctx context.Context) error {
+	c.mu.Lock()
+	cols := append([]string(nil), c.authColls...)
+	c.mu.Unlock()
+
+	var errs []string
+	for _, col := range cols {
+		token, err := c.login(ctx, col)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", col, err))
+			continue
+		}
+		c.mu.Lock()
+		c.token = token
+		c.authColls = moveFront(c.authColls, col)
+		c.mu.Unlock()
+		return nil
+	}
+	return fmt.Errorf("upsnap auth failed for [%s]: %s", strings.Join(cols, ", "), strings.Join(errs, "; "))
+}
+
+// login does one auth-with-password against a single collection.
+func (c *Client) login(ctx context.Context, col string) (string, error) {
 	payload, _ := json.Marshal(map[string]string{"identity": c.user, "password": c.pass})
-	url := c.base + "/api/collections/" + c.authColl + "/auth-with-password"
+	url := c.base + "/api/collections/" + col + "/auth-with-password"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
-		return err
+		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode/100 != 2 {
-		return fmt.Errorf("upsnap auth failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return "", fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	var out struct {
 		Token string `json:"token"`
 	}
 	if err := json.Unmarshal(body, &out); err != nil {
-		return fmt.Errorf("upsnap auth: decode response: %w", err)
+		return "", fmt.Errorf("decode: %w", err)
 	}
 	if out.Token == "" {
-		return fmt.Errorf("upsnap auth: empty token in response")
+		return "", fmt.Errorf("empty token")
 	}
-	c.mu.Lock()
-	c.token = out.Token
-	c.mu.Unlock()
-	return nil
+	return out.Token, nil
 }
 
 // request does a GET against the UpSnap API, authenticating on first use and
@@ -381,6 +409,18 @@ func pickOne(it map[string]any, fields []string) map[string]any {
 		}
 	}
 	return m
+}
+
+// moveFront returns s with v placed first (used to pin the winning auth collection).
+func moveFront(s []string, v string) []string {
+	out := make([]string, 0, len(s))
+	out = append(out, v)
+	for _, x := range s {
+		if x != v {
+			out = append(out, x)
+		}
+	}
+	return out
 }
 
 func str(v any) string {
