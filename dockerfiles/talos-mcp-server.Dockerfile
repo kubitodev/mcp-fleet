@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # Nosmoht/talos-mcp-server ships release binaries but no image — build from the
 # vendored source. Static binary → distroless nonroot. Context = vendor/talos-mcp-server.
-FROM golang:1.26-alpine AS build
+FROM golang:1.27-alpine AS build
 WORKDIR /src
 # module cache layer
 COPY go.mod go.sum ./
