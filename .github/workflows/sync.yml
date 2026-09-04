@@ -31,7 +31,7 @@ jobs:
       matrix: ${{ steps.plan.outputs.matrix }}
       any: ${{ steps.plan.outputs.any }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: mikefarah/yq@v4
 
       - name: Vendor sources (only when the ref differs)
@@ -70,7 +70,7 @@ jobs:
       matrix:
         mcp: ${{ fromJSON(needs.sync.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: main # pick up the source the sync job just committed
 
