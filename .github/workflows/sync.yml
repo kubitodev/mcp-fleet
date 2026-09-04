@@ -94,7 +94,7 @@ jobs:
             org.opencontainers.image.version=${{ matrix.mcp.ref }}
 
       - id: push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ${{ matrix.mcp.context }}
           file: ${{ matrix.mcp.dockerfile }}
