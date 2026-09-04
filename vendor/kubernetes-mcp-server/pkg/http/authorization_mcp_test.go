@@ -1,0 +1,997 @@
+package http
+
+import (
+	"flag"
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/coreos/go-oidc/v3/oidc"
+	"github.com/coreos/go-oidc/v3/oidc/oidctest"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/stretchr/testify/suite"
+	"k8s.io/klog/v2"
+	"k8s.io/klog/v2/textlogger"
+
+	"github.com/containers/kubernetes-mcp-server/internal/test"
+	"github.com/containers/kubernetes-mcp-server/pkg/api"
+)
+
+// bearerRoundTripper adds a static Authorization: Bearer header to every
+// outbound request. Used by the SSE transport test below, since
+// mcp.SSEClientTransport does not expose a headers option.
+type bearerRoundTripper struct {
+	token string
+	base  http.RoundTripper
+}
+
+func (b *bearerRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
+	// http.RoundTripper must not modify the request it is given; clone before
+	// adding the Authorization header.
+	clone := r.Clone(r.Context())
+	clone.Header.Set("Authorization", "Bearer "+b.token)
+	return b.base.RoundTrip(clone)
+}
+
+type AuthorizationSuite struct {
+	BaseHttpSuite
+	mcpClient *test.McpClient
+	klogState klog.State
+	logBuffer test.SyncBuffer
+}
+
+func (s *AuthorizationSuite) SetupTest() {
+	s.BaseHttpSuite.SetupTest()
+
+	// Capture logs
+	s.logBuffer.Reset()
+	s.klogState = klog.CaptureState()
+	flags := flag.NewFlagSet("test", flag.ContinueOnError)
+	klog.InitFlags(flags)
+	_ = flags.Set("v", "5")
+	s.Logger = textlogger.NewLogger(textlogger.NewConfig(textlogger.Verbosity(5), textlogger.Output(&s.logBuffer)))
+
+	// Default Auth settings (overridden in tests as needed)
+	s.OidcProvider = nil
+	s.StaticConfig.RequireOAuth = true
+	s.StaticConfig.OAuthAudience = ""
+	s.StaticConfig.StsClientId = ""
+	s.StaticConfig.StsClientSecret = ""
+	s.StaticConfig.StsAudience = ""
+	s.StaticConfig.StsScopes = []string{}
+}
+
+func (s *AuthorizationSuite) TearDownTest() {
+	s.BaseHttpSuite.TearDownTest()
+	s.klogState.Restore()
+
+	if s.mcpClient != nil {
+		s.mcpClient.Close()
+		s.mcpClient = nil
+	}
+}
+
+func (s *AuthorizationSuite) StartClient(headers ...map[string]string) {
+	endpoint := fmt.Sprintf("http://127.0.0.1:%s/mcp", s.StaticConfig.Port)
+	options := []test.McpClientOption{
+		test.WithEndpoint(endpoint),
+		test.WithAllowConnectionError(),
+	}
+	if len(headers) > 0 && len(headers[0]) > 0 {
+		options = append(options, test.WithHTTPHeaders(headers[0]))
+	}
+	s.mcpClient = test.NewMcpClient(s.T(), nil, options...)
+}
+
+func (s *AuthorizationSuite) HttpGet(authHeader string) *http.Response {
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%s/mcp", s.StaticConfig.Port), nil)
+	s.Require().NoError(err, "Failed to create request")
+	if authHeader != "" {
+		req.Header.Set("Authorization", authHeader)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	s.Require().NoError(err, "Failed to get protected endpoint")
+	return resp
+}
+
+func (s *AuthorizationSuite) TestAuthorizationUnauthorizedMissingHeader() {
+	// Missing Authorization header
+	s.StartServer()
+	s.StartClient()
+
+	s.Run("Initialize returns error for MISSING Authorization header", func() {
+		s.Nil(s.mcpClient.Session, "Expected nil session for failed authentication")
+	})
+
+	s.Run("Protected resource with MISSING Authorization header", func() {
+		resp := s.HttpGet("")
+		s.T().Cleanup(func() { _ = resp.Body.Close() })
+
+		s.Run("returns 401 - Unauthorized status", func() {
+			s.Equal(401, resp.StatusCode, "Expected HTTP 401 for MISSING Authorization header")
+		})
+		s.Run("returns WWW-Authenticate header", func() {
+			authHeader := resp.Header.Get("WWW-Authenticate")
+			expected := `Bearer realm="Kubernetes MCP Server", error="missing_token"`
+			s.Equal(expected, authHeader, "Expected WWW-Authenticate header to match")
+		})
+		s.Run("logs error", func() {
+			s.Contains(s.logBuffer.String(), "Authentication failed - missing or invalid bearer token", "Expected log entry for missing or invalid bearer token")
+		})
+	})
+}
+
+func (s *AuthorizationSuite) TestAuthorizationUnauthorizedHeaderIncompatible() {
+	// Authorization header without Bearer prefix
+	s.StartServer()
+	s.StartClient(map[string]string{
+		"Authorization": "Basic YWxhZGRpbjpvcGVuc2VzYW1l",
+	})
+
+	s.Run("Initialize returns error for INCOMPATIBLE Authorization header", func() {
+		s.Nil(s.mcpClient.Session, "Expected nil session for failed authentication")
+	})
+
+	s.Run("Protected resource with INCOMPATIBLE Authorization header", func() {
+		resp := s.HttpGet("Basic YWxhZGRpbjpvcGVuc2VzYW1l")
+		s.T().Cleanup(func() { _ = resp.Body.Close() })
+
+		s.Run("returns 401 - Unauthorized status", func() {
+			s.Equal(401, resp.StatusCode, "Expected HTTP 401 for INCOMPATIBLE Authorization header")
+		})
+		s.Run("returns WWW-Authenticate header", func() {
+			authHeader := resp.Header.Get("WWW-Authenticate")
+			expected := `Bearer realm="Kubernetes MCP Server", error="missing_token"`
+			s.Equal(expected, authHeader, "Expected WWW-Authenticate header to match")
+		})
+		s.Run("logs error", func() {
+			s.Contains(s.logBuffer.String(), "Authentication failed - missing or invalid bearer token", "Expected log entry for missing or invalid bearer token")
+		})
+	})
+}
+
+func (s *AuthorizationSuite) TestAuthorizationUnauthorizedHeaderInvalid() {
+	// Invalid Authorization header
+	s.StartServer()
+	s.StartClient(map[string]string{
+		"Authorization": "Bearer " + strings.ReplaceAll(tokenBasicNotExpired, ".", ".invalid"),
+	})
+
+	s.Run("Initialize returns error for INVALID Authorization header", func() {
+		s.Nil(s.mcpClient.Session, "Expected nil session for failed authentication")
+	})
+
+	s.Run("Protected resource with INVALID Authorization header", func() {
+		resp := s.HttpGet("Bearer " + strings.ReplaceAll(tokenBasicNotExpired, ".", ".invalid"))
+		s.T().Cleanup(func() { _ = resp.Body.Close() })
+
+		s.Run("returns 401 - Unauthorized status", func() {
+			s.Equal(401, resp.StatusCode, "Expected HTTP 401 for INVALID Authorization header")
+		})
+		s.Run("returns WWW-Authenticate header", func() {
+			authHeader := resp.Header.Get("WWW-Authenticate")
+			expected := `Bearer realm="Kubernetes MCP Server", error="invalid_token"`
+			s.Equal(expected, authHeader, "Expected WWW-Authenticate header to match")
+		})
+		s.Run("logs error", func() {
+			s.Contains(s.logBuffer.String(), "Authentication failed - JWT validation error", "Expected log entry for JWT validation error")
+			s.Contains(s.logBuffer.String(), "failed to parse JWT token: illegal base64 data", "Expected log entry for JWT validation error details")
+		})
+	})
+}
+
+func (s *AuthorizationSuite) TestAuthorizationUnauthorizedHeaderExpired() {
+	// Expired Authorization Bearer token
+	s.StartServer()
+	s.StartClient(map[string]string{
+		"Authorization": "Bearer " + tokenBasicExpired,
+	})
+
+	s.Run("Initialize returns error for EXPIRED Authorization header", func() {
+		s.Nil(s.mcpClient.Session, "Expected nil session for failed authentication")
+	})
+
+	s.Run("Protected resource with EXPIRED Authorization header", func() {
+		resp := s.HttpGet("Bearer " + tokenBasicExpired)
+		s.T().Cleanup(func() { _ = resp.Body.Close() })
+
+		s.Run("returns 401 - Unauthorized status", func() {
+			s.Equal(401, resp.StatusCode, "Expected HTTP 401 for EXPIRED Authorization header")
+		})
+		s.Run("returns WWW-Authenticate header", func() {
+			authHeader := resp.Header.Get("WWW-Authenticate")
+			expected := `Bearer realm="Kubernetes MCP Server", error="invalid_token"`
+			s.Equal(expected, authHeader, "Expected WWW-Authenticate header to match")
+		})
+		s.Run("logs error", func() {
+			s.Contains(s.logBuffer.String(), "Authentication failed - JWT validation error", "Expected log entry for JWT validation error")
+			s.Contains(s.logBuffer.String(), "validation failed, token is expired (exp)", "Expected log entry for JWT validation error details")
+		})
+	})
+}
+
+func (s *AuthorizationSuite) TestAuthorizationUnauthorizedHeaderInvalidAudience() {
+	// Invalid audience claim Bearer token
+	s.StaticConfig.OAuthAudience = "expected-audience"
+	s.StartServer()
+	s.StartClient(map[string]string{
+		"Authorization": "Bearer " + tokenBasicNotExpired,
+	})
+
+	s.Run("Initialize returns error for INVALID AUDIENCE Authorization header", func() {
+		s.Nil(s.mcpClient.Session, "Expected nil session for failed authentication")
+	})
+
+	s.Run("Protected resource with INVALID AUDIENCE Authorization header", func() {
+		resp := s.HttpGet("Bearer " + tokenBasicNotExpired)
+		s.T().Cleanup(func() { _ = resp.Body.Close() })
+
+		s.Run("returns 401 - Unauthorized status", func() {
+			s.Equal(401, resp.StatusCode, "Expected HTTP 401 for INVALID AUDIENCE Authorization header")
+		})
+		s.Run("returns WWW-Authenticate header", func() {
+			authHeader := resp.Header.Get("WWW-Authenticate")
+			expected := `Bearer realm="Kubernetes MCP Server", audience="expected-audience", error="invalid_token"`
+			s.Equal(expected, authHeader, "Expected WWW-Authenticate header to match")
+		})
+		s.Run("logs error", func() {
+			s.Contains(s.logBuffer.String(), "Authentication failed - JWT validation error", "Expected log entry for JWT validation error")
+			s.Contains(s.logBuffer.String(), "invalid audience claim (aud)", "Expected log entry for JWT validation error details")
+		})
+	})
+}
+
+func (s *AuthorizationSuite) TestAuthorizationUnauthorizedOidcValidation() {
+	// Failed OIDC validation
+	s.StaticConfig.OAuthAudience = "mcp-server"
+	oidcTestServer := NewOidcTestServer(s.T())
+	s.T().Cleanup(oidcTestServer.Close)
+	s.OidcProvider = oidcTestServer.Provider
+	s.StartServer()
+	s.StartClient(map[string]string{
+		"Authorization": "Bearer " + tokenBasicNotExpired,
+	})
+
+	s.Run("Initialize returns error for INVALID OIDC Authorization header", func() {
+		s.Nil(s.mcpClient.Session, "Expected nil session for failed authentication")
+	})
+
+	s.Run("Protected resource with INVALID OIDC Authorization header", func() {
+		resp := s.HttpGet("Bearer " + tokenBasicNotExpired)
+		s.T().Cleanup(func() { _ = resp.Body.Close() })
+
+		s.Run("returns 401 - Unauthorized status", func() {
+			s.Equal(401, resp.StatusCode, "Expected HTTP 401 for INVALID OIDC Authorization header")
+		})
+		s.Run("returns WWW-Authenticate header", func() {
+			authHeader := resp.Header.Get("WWW-Authenticate")
+			expected := `Bearer realm="Kubernetes MCP Server", audience="mcp-server", error="invalid_token"`
+			s.Equal(expected, authHeader, "Expected WWW-Authenticate header to match")
+		})
+		s.Run("logs error", func() {
+			s.Contains(s.logBuffer.String(), "Authentication failed - JWT validation error", "Expected log entry for JWT validation error")
+			s.Contains(s.logBuffer.String(), "OIDC token validation error: failed to verify signature", "Expected log entry for OIDC validation error details")
+		})
+	})
+}
+
+func (s *AuthorizationSuite) TestAuthorizationUnauthorizedTokenExchangeFailure() {
+	s.MockServer.ResetHandlers()
+
+	oidcTestServer := NewOidcTestServer(s.T())
+	s.T().Cleanup(oidcTestServer.Close)
+	rawClaims := `{
+		"iss": "` + oidcTestServer.URL + `",
+		"exp": ` + strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10) + `,
+		"aud": "%s"
+	}`
+	validOidcClientToken := oidctest.SignIDToken(oidcTestServer.PrivateKey, "test-oidc-key-id", oidc.RS256,
+		fmt.Sprintf(rawClaims, "mcp-server"))
+	oidcTestServer.TokenEndpointHandler = func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}
+
+	s.OidcProvider = oidcTestServer.Provider
+	s.StaticConfig.OAuthAudience = "mcp-server"
+	s.StaticConfig.StsClientId = "test-sts-client-id"
+	s.StaticConfig.StsClientSecret = "test-sts-client-secret"
+	s.StaticConfig.StsAudience = "backend-audience"
+	s.StaticConfig.StsScopes = []string{"backend-scope"}
+	s.logBuffer.Reset()
+	s.StartServer()
+	s.StartClient(map[string]string{
+		"Authorization": "Bearer " + validOidcClientToken,
+	})
+
+	s.Run("Protected resource", func() {
+		s.Run("Initialize returns OK for VALID OIDC EXCHANGE Authorization header", func() {
+			s.Require().NotNil(s.mcpClient.Session, "Expected session for valid authentication")
+			s.Require().NotNil(s.mcpClient.Session.InitializeResult(), "Expected initial request to not be nil")
+		})
+		s.Run("Call tool returns error when token exchange fails", func() {
+			toolResult, err := s.mcpClient.Session.CallTool(s.T().Context(), &mcp.CallToolParams{
+				Name:      "events_list",
+				Arguments: map[string]any{},
+			})
+			// When token exchange is explicitly configured and fails,
+			// the error should propagate rather than silently passing through
+			s.Require().Error(err, "Expected tool call to fail when token exchange fails")
+			s.Require().Nil(toolResult, "Expected no tool result when token exchange fails")
+		})
+	})
+	s.mcpClient.Close()
+	s.mcpClient = nil
+	s.stopRunningServer()
+}
+
+func (s *AuthorizationSuite) TestAuthorizationRequireOAuthFalse() {
+	s.StaticConfig.RequireOAuth = false
+	s.StartServer()
+	s.StartClient()
+
+	s.Run("Initialize returns OK for MISSING Authorization header", func() {
+		s.Require().NotNil(s.mcpClient.Session, "Expected session for successful authentication")
+		s.Require().NotNil(s.mcpClient.Session.InitializeResult(), "Expected initial request to not be nil")
+	})
+	s.mcpClient.Close()
+	s.mcpClient = nil
+	s.stopRunningServer()
+}
+
+func (s *AuthorizationSuite) TestAuthorizationRawToken() {
+	s.MockServer.ResetHandlers()
+	s.StaticConfig.SkipJWTVerification = true
+
+	cases := []string{"", "mcp-server"}
+	for _, audience := range cases {
+		s.StaticConfig.OAuthAudience = audience
+		s.logBuffer.Reset()
+		s.StartServer()
+		s.StartClient(map[string]string{
+			"Authorization": "Bearer " + tokenBasicNotExpired,
+		})
+
+		s.Run(fmt.Sprintf("Protected resource with audience = '%s'", audience), func() {
+			s.Run("Initialize returns OK for VALID Authorization header", func() {
+				s.Require().NotNil(s.mcpClient.Session, "Expected session for successful authentication")
+				s.Require().NotNil(s.mcpClient.Session.InitializeResult(), "Expected initial request to not be nil")
+			})
+		})
+		s.mcpClient.Close()
+		s.mcpClient = nil
+		s.stopRunningServer()
+	}
+}
+
+func (s *AuthorizationSuite) TestAuthorizationOidcToken() {
+	s.MockServer.ResetHandlers()
+
+	oidcTestServer := NewOidcTestServer(s.T())
+	s.T().Cleanup(oidcTestServer.Close)
+	rawClaims := `{
+		"iss": "` + oidcTestServer.URL + `",
+		"exp": ` + strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10) + `,
+		"aud": "mcp-server"
+	}`
+	validOidcToken := oidctest.SignIDToken(oidcTestServer.PrivateKey, "test-oidc-key-id", oidc.RS256, rawClaims)
+
+	s.OidcProvider = oidcTestServer.Provider
+	s.StaticConfig.OAuthAudience = "mcp-server"
+	s.StartServer()
+	s.StartClient(map[string]string{
+		"Authorization": "Bearer " + validOidcToken,
+	})
+
+	s.Run("Protected resource", func() {
+		s.Run("Initialize returns OK for VALID OIDC Authorization header", func() {
+			s.Require().NotNil(s.mcpClient.Session, "Expected session for successful authentication")
+			s.Require().NotNil(s.mcpClient.Session.InitializeResult(), "Expected initial request to not be nil")
+		})
+	})
+	s.mcpClient.Close()
+	s.mcpClient = nil
+	s.stopRunningServer()
+}
+
+// TestAuthorizationOidcTokenExchange verifies RFC 8693 / On-Behalf-Of token
+// exchange on both MCP transports. StreamableHTTP propagates the bearer via
+// request headers directly; SSE relies on AuthorizationMiddleware writing the
+// validated token into the request context (OAuthAuthorizationHeader) and
+// authHeaderPropagationMiddleware bridging it into the MCP RequestExtra, so
+// both transports must be exercised end-to-end.
+// SSE coverage: https://github.com/containers/kubernetes-mcp-server/issues/1043
+func (s *AuthorizationSuite) TestAuthorizationOidcTokenExchange() {
+	oidcTestServer := NewOidcTestServer(s.T())
+	s.T().Cleanup(oidcTestServer.Close)
+	rawClaims := `{
+		"iss": "` + oidcTestServer.URL + `",
+		"exp": ` + strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10) + `,
+		"aud": "%s"
+	}`
+	validOidcClientToken := oidctest.SignIDToken(oidcTestServer.PrivateKey, "test-oidc-key-id", oidc.RS256,
+		fmt.Sprintf(rawClaims, "mcp-server"))
+	validOidcBackendToken := oidctest.SignIDToken(oidcTestServer.PrivateKey, "test-oidc-key-id", oidc.RS256,
+		fmt.Sprintf(rawClaims, "backend-audience"))
+	oidcTestServer.TokenEndpointHandler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"access_token":"%s","token_type":"Bearer","expires_in":253402297199}`, validOidcBackendToken)
+	}
+
+	s.OidcProvider = oidcTestServer.Provider
+	s.StaticConfig.OAuthAudience = "mcp-server"
+	s.StaticConfig.StsClientId = "test-sts-client-id"
+	s.StaticConfig.StsClientSecret = "test-sts-client-secret"
+	s.StaticConfig.StsAudience = "backend-audience"
+	s.StaticConfig.StsScopes = []string{"backend-scope"}
+
+	testCases := []struct {
+		name    string
+		connect func() *mcp.ClientSession
+	}{
+		{
+			name: "StreamableHTTP transport",
+			connect: func() *mcp.ClientSession {
+				s.StartClient(map[string]string{
+					"Authorization": "Bearer " + validOidcClientToken,
+				})
+				s.Require().NotNil(s.mcpClient.Session, "Expected session for successful authentication")
+				return s.mcpClient.Session
+			},
+		},
+		{
+			name: "SSE transport",
+			connect: func() *mcp.ClientSession {
+				httpClient := &http.Client{
+					Transport: &bearerRoundTripper{token: validOidcClientToken, base: http.DefaultTransport},
+				}
+				sseClient := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "1.33.7"}, nil)
+				transport := &mcp.SSEClientTransport{
+					Endpoint:   fmt.Sprintf("http://127.0.0.1:%s/sse", s.StaticConfig.Port),
+					HTTPClient: httpClient,
+				}
+				session, err := sseClient.Connect(s.T().Context(), transport, nil)
+				s.Require().NoError(err, "Expected no error connecting SSE MCP client")
+				return session
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		s.Run(tc.name, func() {
+			s.MockServer.ResetHandlers()
+			// Capture the Authorization header the MCP server sends to the
+			// Kubernetes backend. The downstream credential is the
+			// security-relevant observable: token exchange must replace the
+			// user token with the exchanged token before reaching the cluster.
+			var backendAuth atomic.Value
+			s.MockServer.Handle(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if auth := r.Header.Get("Authorization"); auth != "" {
+					backendAuth.Store(auth)
+				}
+			}))
+			s.logBuffer.Reset()
+			s.StartServer()
+
+			session := tc.connect()
+
+			s.Run("Initialize returns OK for VALID OIDC EXCHANGE Authorization header", func() {
+				s.Require().NotNil(session.InitializeResult(), "Expected initial request to not be nil")
+			})
+			s.Run("Call tool exchanges token for VALID OIDC EXCHANGE Authorization header", func() {
+				toolResult, err := session.CallTool(s.T().Context(), &mcp.CallToolParams{
+					Name:      "events_list",
+					Arguments: map[string]any{},
+				})
+				s.Require().NoError(err, "Expected no error calling tool")
+				s.Require().NotNil(toolResult, "Expected tool result to not be nil")
+			})
+			s.Run("Backend receives exchanged token, not original user token", func() {
+				got, _ := backendAuth.Load().(string)
+				s.Require().NotEmpty(got, "Expected backend to receive an Authorization header")
+				s.Equal("Bearer "+validOidcBackendToken, got,
+					"Backend must receive the exchanged token; receiving the original user token would mean token exchange silently no-op'd")
+			})
+
+			if s.mcpClient != nil {
+				// McpClient.Close closes the underlying Session for us.
+				s.mcpClient.Close()
+				s.mcpClient = nil
+			} else {
+				s.Require().NoError(session.Close(), "Expected SSE session to close cleanly")
+			}
+			s.stopRunningServer()
+		})
+	}
+}
+
+func (s *AuthorizationSuite) TestAuthorizationPassthroughWarning() {
+	// When require_oauth=true, skip_jwt_verification=true, and no OIDC provider
+	// is configured (passthrough mode), a warning log should be emitted once.
+	s.MockServer.ResetHandlers()
+	s.StaticConfig.OAuthAudience = "mcp-server"
+	s.StaticConfig.AuthorizationURL = ""
+	s.StaticConfig.SkipJWTVerification = true
+	s.logBuffer.Reset()
+	s.StartServer()
+	s.StartClient(map[string]string{
+		"Authorization": "Bearer " + tokenBasicNotExpired,
+	})
+
+	s.Run("warning log emitted for passthrough mode", func() {
+		s.Require().NotNil(s.mcpClient.Session, "Expected session for successful authentication")
+		s.Require().NotNil(s.mcpClient.Session.InitializeResult(), "Expected initial request to not be nil")
+		s.Contains(s.logBuffer.String(), "Bearer token forwarded without local validation",
+			"Expected warning log for passthrough mode")
+		s.Contains(s.logBuffer.String(), "cluster is the sole authority",
+			"Expected guidance that cluster validates in warning")
+	})
+	s.mcpClient.Close()
+	s.mcpClient = nil
+	s.stopRunningServer()
+}
+
+func (s *AuthorizationSuite) TestAuthorizationPassthroughWarningOnce() {
+	// The warning should fire exactly once even with multiple requests.
+	s.MockServer.ResetHandlers()
+	s.StaticConfig.OAuthAudience = "mcp-server"
+	s.StaticConfig.AuthorizationURL = ""
+	s.StaticConfig.SkipJWTVerification = true
+	s.logBuffer.Reset()
+	s.StartServer()
+
+	// Send multiple HTTP requests
+	for i := 0; i < 3; i++ {
+		resp := s.HttpGet("Bearer " + tokenBasicNotExpired)
+		_ = resp.Body.Close()
+	}
+
+	s.Run("warning log appears exactly once", func() {
+		logs := s.logBuffer.String()
+		count := strings.Count(logs, "Bearer token forwarded without local validation")
+		s.Equal(1, count, "Expected warning to fire exactly once, got %d", count)
+	})
+	s.stopRunningServer()
+}
+
+func (s *AuthorizationSuite) TestAuthorizationPassthroughRejectedWithoutSkipFlag() {
+	// When require_oauth=true, skip_jwt_verification=false (default), and no OIDC
+	// provider is configured, requests should be rejected at runtime.
+	s.MockServer.ResetHandlers()
+	s.StaticConfig.OAuthAudience = "mcp-server"
+	s.StaticConfig.AuthorizationURL = ""
+	s.StaticConfig.SkipJWTVerification = false
+	s.logBuffer.Reset()
+	s.StartServer()
+	s.StartClient(map[string]string{
+		"Authorization": "Bearer " + tokenBasicNotExpired,
+	})
+
+	s.Run("MCP session is rejected without skip_jwt_verification", func() {
+		s.Nil(s.mcpClient.Session, "Expected no session when skip_jwt_verification is false")
+	})
+
+	s.Run("HTTP request returns 500 Internal Server Error", func() {
+		resp := s.HttpGet("Bearer " + tokenBasicNotExpired)
+		s.T().Cleanup(func() { _ = resp.Body.Close() })
+
+		s.Equal(http.StatusInternalServerError, resp.StatusCode, "Expected HTTP 500 for server misconfiguration")
+	})
+
+	s.Run("logs rejection", func() {
+		s.Contains(s.logBuffer.String(), "JWT verification not configured",
+			"Expected log entry for JWT verification not configured")
+	})
+
+	if s.mcpClient != nil {
+		s.mcpClient.Close()
+		s.mcpClient = nil
+	}
+	s.stopRunningServer()
+}
+
+func (s *AuthorizationSuite) TestAuthorizationUnknownWellKnownPathRequiresAuth() {
+	s.StartServer()
+
+	unknownPaths := []string{
+		"/.well-known/unknown-endpoint",
+		"/.well-known/jwks.json",
+		"/.well-known/admin",
+		"/.well-known/",
+	}
+	for _, path := range unknownPaths {
+		s.Run(fmt.Sprintf("%s requires auth", path), func() {
+			req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%s%s", s.StaticConfig.Port, path), nil)
+			s.Require().NoError(err)
+			resp, err := http.DefaultClient.Do(req)
+			s.Require().NoError(err)
+			s.T().Cleanup(func() { _ = resp.Body.Close() })
+			s.Equal(http.StatusUnauthorized, resp.StatusCode, "Unknown well-known path should require auth")
+		})
+	}
+	s.stopRunningServer()
+}
+
+func (s *AuthorizationSuite) TestAuthorizationExemptEndpointsFromOAuth() {
+	// https://github.com/containers/kubernetes-mcp-server/issues/932
+	// https://github.com/containers/kubernetes-mcp-server/issues/964
+	// When require_oauth is true, infrastructure/observability endpoints should
+	// still be accessible without an OAuth token.
+	s.StartServer()
+
+	exemptEndpoints := []string{"/healthz", "/metrics", "/stats"}
+	for _, endpoint := range exemptEndpoints {
+		s.Run(fmt.Sprintf("%s accessible without OAuth token", endpoint), func() {
+			req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%s%s", s.StaticConfig.Port, endpoint), nil)
+			s.Require().NoError(err, "Failed to create request")
+			resp, err := http.DefaultClient.Do(req)
+			s.Require().NoError(err, "Failed to get %s endpoint", endpoint)
+			s.T().Cleanup(func() { _ = resp.Body.Close() })
+			s.Equal(http.StatusOK, resp.StatusCode, "Expected %s to be accessible without OAuth token", endpoint)
+		})
+	}
+}
+
+// TestAuthorizationRawPassthroughStreamableHTTP verifies that when
+// require_oauth=false the server forwards the client's Authorization header
+// verbatim to the Kubernetes backend over the StreamableHTTP transport, which
+// propagates the bearer via request headers directly.
+func (s *AuthorizationSuite) TestAuthorizationRawPassthroughStreamableHTTP() {
+	s.MockServer.ResetHandlers()
+	rawK8sToken := "k8s-service-account-token-not-a-jwt"
+
+	var backendAuth atomic.Value
+	s.MockServer.Handle(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if auth := r.Header.Get("Authorization"); auth != "" {
+			backendAuth.Store(auth)
+		}
+	}))
+
+	s.StaticConfig.RequireOAuth = false
+	s.StartServer()
+	s.StartClient(map[string]string{
+		"Authorization": "Bearer " + rawK8sToken,
+	})
+
+	s.Run("Initialize succeeds without OAuth", func() {
+		s.Require().NotNil(s.mcpClient.Session, "Expected session for successful connection")
+		s.Require().NotNil(s.mcpClient.Session.InitializeResult(), "Expected initial request to not be nil")
+	})
+	s.Run("Tool call forwards raw token to backend", func() {
+		toolResult, err := s.mcpClient.Session.CallTool(s.T().Context(), &mcp.CallToolParams{
+			Name:      "events_list",
+			Arguments: map[string]any{},
+		})
+		s.Require().NoError(err, "Expected no error calling tool")
+		s.Require().NotNil(toolResult, "Expected tool result to not be nil")
+	})
+	s.Run("Backend receives the raw token", func() {
+		got, _ := backendAuth.Load().(string)
+		s.Require().NotEmpty(got, "Expected backend to receive an Authorization header")
+		s.Equal("Bearer "+rawK8sToken, got,
+			"Backend must receive the original raw token passed in the Authorization header")
+	})
+
+	s.mcpClient.Close()
+	s.mcpClient = nil
+	s.stopRunningServer()
+}
+
+// TestAuthorizationRawPassthroughSSE is the SSE counterpart to
+// TestAuthorizationRawPassthroughStreamableHTTP. SSE does not propagate HTTP
+// headers into the MCP RequestExtra, so the Authorization header must be
+// extracted by AuthorizationMiddleware (even in the require_oauth=false branch)
+// and bridged into the MCP context via authHeaderPropagationMiddleware.
+// SSE coverage: https://github.com/containers/kubernetes-mcp-server/issues/1043
+func (s *AuthorizationSuite) TestAuthorizationRawPassthroughSSE() {
+	s.MockServer.ResetHandlers()
+	rawK8sToken := "k8s-service-account-token-not-a-jwt"
+
+	var backendAuth atomic.Value
+	s.MockServer.Handle(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if auth := r.Header.Get("Authorization"); auth != "" {
+			backendAuth.Store(auth)
+		}
+	}))
+
+	s.StaticConfig.RequireOAuth = false
+	s.StartServer()
+
+	httpClient := &http.Client{
+		Transport: &bearerRoundTripper{token: rawK8sToken, base: http.DefaultTransport},
+	}
+	sseClient := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "1.33.7"}, nil)
+	transport := &mcp.SSEClientTransport{
+		Endpoint:   fmt.Sprintf("http://127.0.0.1:%s/sse", s.StaticConfig.Port),
+		HTTPClient: httpClient,
+	}
+	session, err := sseClient.Connect(s.T().Context(), transport, nil)
+	s.Require().NoError(err, "Expected no error connecting SSE MCP client")
+
+	s.Run("Initialize succeeds without OAuth", func() {
+		s.Require().NotNil(session.InitializeResult(), "Expected initial request to not be nil")
+	})
+	s.Run("Tool call forwards raw token to backend", func() {
+		toolResult, err := session.CallTool(s.T().Context(), &mcp.CallToolParams{
+			Name:      "events_list",
+			Arguments: map[string]any{},
+		})
+		s.Require().NoError(err, "Expected no error calling tool")
+		s.Require().NotNil(toolResult, "Expected tool result to not be nil")
+	})
+	s.Run("Backend receives the raw token", func() {
+		got, _ := backendAuth.Load().(string)
+		s.Require().NotEmpty(got, "Expected backend to receive an Authorization header")
+		s.Equal("Bearer "+rawK8sToken, got,
+			"Backend must receive the original raw token passed in the Authorization header")
+	})
+
+	s.Require().NoError(session.Close(), "Expected SSE session to close cleanly")
+	s.stopRunningServer()
+}
+
+// TestAuthorizationClusterAuthModeKubeconfigDropsClientToken verifies that
+// when an operator explicitly opts into cluster_auth_mode="kubeconfig", a
+// client-sent Authorization header is cleared before the request reaches the
+// backend — so the backend authenticates as the kubeconfig principal, not the
+// client. This locks in the stsExchangeTokenInContext clear behavior at the
+// HTTP level (previously only covered by unit tests).
+func (s *AuthorizationSuite) TestAuthorizationClusterAuthModeKubeconfigDropsClientToken() {
+	s.MockServer.ResetHandlers()
+	clientToken := "client-sent-token-must-not-reach-backend"
+
+	var backendAuth atomic.Value
+	s.MockServer.Handle(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Store every request's Authorization header (including empty) so we
+		// can assert the client token is never forwarded.
+		backendAuth.Store(r.Header.Get("Authorization"))
+	}))
+
+	s.StaticConfig.RequireOAuth = false
+	s.StaticConfig.ClusterAuthMode = api.ClusterAuthKubeconfig
+	s.StartServer()
+	s.StartClient(map[string]string{
+		"Authorization": "Bearer " + clientToken,
+	})
+
+	s.Run("Initialize succeeds", func() {
+		s.Require().NotNil(s.mcpClient.Session, "Expected session for successful connection")
+		s.Require().NotNil(s.mcpClient.Session.InitializeResult(), "Expected initial request to not be nil")
+	})
+	s.Run("Tool call succeeds via kubeconfig credentials", func() {
+		toolResult, err := s.mcpClient.Session.CallTool(s.T().Context(), &mcp.CallToolParams{
+			Name:      "events_list",
+			Arguments: map[string]any{},
+		})
+		s.Require().NoError(err, "Expected no error calling tool")
+		s.Require().NotNil(toolResult, "Expected tool result to not be nil")
+	})
+	s.Run("Backend does not receive the client-sent Authorization header", func() {
+		got, _ := backendAuth.Load().(string)
+		s.NotEqual("Bearer "+clientToken, got,
+			"Backend must not receive the client-sent token when cluster_auth_mode=kubeconfig")
+	})
+
+	s.mcpClient.Close()
+	s.mcpClient = nil
+	s.stopRunningServer()
+}
+
+// TestAuthorizationPassthroughOpaqueToken verifies that in passthrough mode
+// (skip_jwt_verification=true, no authorization_url) an opaque non-JWT token
+// such as an OpenShift sha256~ service-account token is forwarded to the cluster
+// unmodified — previously ParseJWTClaims would reject it with a 401 before
+// reaching the skip flag.
+func (s *AuthorizationSuite) TestAuthorizationPassthroughOpaqueToken() {
+	s.MockServer.ResetHandlers()
+	opaqueToken := "sha256~abc123openshifttoken"
+
+	var backendAuth atomic.Value
+	s.MockServer.Handle(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if auth := r.Header.Get("Authorization"); auth != "" {
+			backendAuth.Store(auth)
+		}
+	}))
+
+	s.StaticConfig.SkipJWTVerification = true
+	s.StaticConfig.AuthorizationURL = ""
+	s.StartServer()
+	s.StartClient(map[string]string{
+		"Authorization": "Bearer " + opaqueToken,
+	})
+
+	s.Run("Initialize returns OK for opaque token in passthrough mode", func() {
+		s.Require().NotNil(s.mcpClient.Session, "Expected session for passthrough with opaque token")
+		s.Require().NotNil(s.mcpClient.Session.InitializeResult(), "Expected initial request to not be nil")
+	})
+	s.Run("Tool call forwards opaque token to cluster", func() {
+		toolResult, err := s.mcpClient.Session.CallTool(s.T().Context(), &mcp.CallToolParams{
+			Name:      "events_list",
+			Arguments: map[string]any{},
+		})
+		s.Require().NoError(err, "Expected no error calling tool")
+		s.Require().NotNil(toolResult, "Expected tool result to not be nil")
+	})
+	s.Run("Backend receives opaque token unmodified", func() {
+		got, _ := backendAuth.Load().(string)
+		s.Require().NotEmpty(got, "Expected backend to receive an Authorization header")
+		s.Equal("Bearer "+opaqueToken, got,
+			"Passthrough mode must forward the token unchanged; any JWT processing would break opaque tokens")
+	})
+
+	s.mcpClient.Close()
+	s.mcpClient = nil
+	s.stopRunningServer()
+}
+
+// TestAuthorizationPassthroughMalformedJWT verifies that a syntactically invalid
+// JWT string does not produce a 401 in passthrough mode. The early return must
+// fire before ParseJWTClaims is ever called.
+func (s *AuthorizationSuite) TestAuthorizationPassthroughMalformedJWT() {
+	s.MockServer.ResetHandlers()
+
+	s.StaticConfig.SkipJWTVerification = true
+	s.StaticConfig.AuthorizationURL = ""
+	s.StartServer()
+	s.StartClient(map[string]string{
+		"Authorization": "Bearer not.a.jwt.at.all",
+	})
+
+	s.Run("Initialize returns OK for malformed JWT in passthrough mode", func() {
+		s.Require().NotNil(s.mcpClient.Session, "Expected session for malformed JWT in passthrough mode — ParseJWTClaims must not be reached")
+		s.Require().NotNil(s.mcpClient.Session.InitializeResult(), "Expected initial request to not be nil")
+	})
+
+	s.mcpClient.Close()
+	s.mcpClient = nil
+	s.stopRunningServer()
+}
+
+// TestAuthorizationPassthroughMissingHeader verifies that the Bearer header
+// presence check still runs in passthrough mode — the early return fires only
+// after the header has been confirmed present.
+func (s *AuthorizationSuite) TestAuthorizationPassthroughMissingHeader() {
+	s.StaticConfig.SkipJWTVerification = true
+	s.StaticConfig.AuthorizationURL = ""
+	s.StartServer()
+
+	s.Run("Missing Authorization header returns 401 in passthrough mode", func() {
+		resp := s.HttpGet("")
+		s.T().Cleanup(func() { _ = resp.Body.Close() })
+		s.Equal(http.StatusUnauthorized, resp.StatusCode,
+			"Expected HTTP 401 for missing token even in passthrough mode — presence enforcement must remain")
+
+		s.Run("returns WWW-Authenticate header", func() {
+			authHeader := resp.Header.Get("WWW-Authenticate")
+			expected := `Bearer realm="Kubernetes MCP Server", error="missing_token"`
+			s.Equal(expected, authHeader, "Expected WWW-Authenticate header to match")
+		})
+	})
+
+	s.stopRunningServer()
+}
+
+// TestAuthorizationPassthroughExpiredToken verifies that expired JWTs are
+// forwarded to the cluster in passthrough mode without local expiration checks.
+// The cluster is responsible for validating token expiration.
+// Covers test scenario #3 from issue #1131.
+func (s *AuthorizationSuite) TestAuthorizationPassthroughExpiredToken() {
+	s.MockServer.ResetHandlers()
+
+	var backendAuth atomic.Value
+	s.MockServer.Handle(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if auth := r.Header.Get("Authorization"); auth != "" {
+			backendAuth.Store(auth)
+		}
+	}))
+
+	s.StaticConfig.SkipJWTVerification = true
+	s.StaticConfig.AuthorizationURL = ""
+	s.StartServer()
+	s.StartClient(map[string]string{
+		"Authorization": "Bearer " + tokenBasicExpired,
+	})
+
+	s.Run("Initialize returns OK for expired token in passthrough mode", func() {
+		s.Require().NotNil(s.mcpClient.Session, "Expected session for passthrough with expired token — expiration checks must be skipped")
+		s.Require().NotNil(s.mcpClient.Session.InitializeResult(), "Expected initial request to not be nil")
+	})
+	s.Run("Tool call forwards expired token to cluster", func() {
+		toolResult, err := s.mcpClient.Session.CallTool(s.T().Context(), &mcp.CallToolParams{
+			Name:      "events_list",
+			Arguments: map[string]any{},
+		})
+		s.Require().NoError(err, "Expected no error calling tool with expired token in passthrough mode")
+		s.Require().NotNil(toolResult, "Expected tool result to not be nil")
+	})
+	s.Run("Backend receives expired token unmodified", func() {
+		got, _ := backendAuth.Load().(string)
+		s.Require().NotEmpty(got, "Expected backend to receive an Authorization header")
+		s.Equal("Bearer "+tokenBasicExpired, got,
+			"Passthrough mode must forward expired tokens unchanged; cluster validates expiration")
+	})
+
+	s.mcpClient.Close()
+	s.mcpClient = nil
+	s.stopRunningServer()
+}
+
+// TestAuthorizationPassthroughClusterIssuedJWT verifies that JWTs issued by the
+// cluster API server with cluster audience (not mcp-server audience) are forwarded
+// in passthrough mode without audience validation.
+// Covers test scenario #2 from issue #1131.
+func (s *AuthorizationSuite) TestAuthorizationPassthroughClusterIssuedJWT() {
+	s.MockServer.ResetHandlers()
+	// JWT with only cluster API server audience, not mcp-server
+	// https://jwt.io/#token=eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzI1NiIsImtpZCI6Ijk4ZDU3YmUwNWI3ZjUzNWIwMzYyYjg2MDJhNTJlNGYxIn0.eyJhdWQiOlsiaHR0cHM6Ly9rdWJlcm5ldGVzLmRlZmF1bHQuc3ZjLmNsdXN0ZXIubG9jYWwiXSwiZXhwIjoyNTM0MDIyOTcxOTksImlhdCI6MCwiaXNzIjoiaHR0cHM6Ly9rdWJlcm5ldGVzLmRlZmF1bHQuc3ZjLmNsdXN0ZXIubG9jYWwiLCJqdGkiOiI5OTIyMmQ1Ni0zNDBlLTRlYjYtODU4OC0yNjE0MTFmMzVkMjYiLCJrdWJlcm5ldGVzLmlvIjp7Im5hbWVzcGFjZSI6ImRlZmF1bHQiLCJzZXJ2aWNlYWNjb3VudCI6eyJuYW1lIjoiZGVmYXVsdCIsInVpZCI6ImVhY2I2YWQyLTgwYjctNDE3OS04NDNkLTkyZWIxZTZiYmJhNiJ9fSwibmJmIjowLCJzdWIiOiJzeXN0ZW06c2VydmljZWFjY291bnQ6ZGVmYXVsdDpkZWZhdWx0In0.xqPTckVQOVzrP8VXVPeQw9Y9I9mAQ-1eGNp14xQkJKs9dJCN-3uxOBGS4VaL1Qk5N71RD7rIjC2HhgJ5YK1YBw // notsecret
+	clusterIssuedToken := "eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzI1NiIsImtpZCI6Ijk4ZDU3YmUwNWI3ZjUzNWIwMzYyYjg2MDJhNTJlNGYxIn0.eyJhdWQiOlsiaHR0cHM6Ly9rdWJlcm5ldGVzLmRlZmF1bHQuc3ZjLmNsdXN0ZXIubG9jYWwiXSwiZXhwIjoyNTM0MDIyOTcxOTksImlhdCI6MCwiaXNzIjoiaHR0cHM6Ly9rdWJlcm5ldGVzLmRlZmF1bHQuc3ZjLmNsdXN0ZXIubG9jYWwiLCJqdGkiOiI5OTIyMmQ1Ni0zNDBlLTRlYjYtODU4OC0yNjE0MTFmMzVkMjYiLCJrdWJlcm5ldGVzLmlvIjp7Im5hbWVzcGFjZSI6ImRlZmF1bHQiLCJzZXJ2aWNlYWNjb3VudCI6eyJuYW1lIjoiZGVmYXVsdCIsInVpZCI6ImVhY2I2YWQyLTgwYjctNDE3OS04NDNkLTkyZWIxZTZiYmJhNiJ9fSwibmJmIjowLCJzdWIiOiJzeXN0ZW06c2VydmljZWFjY291bnQ6ZGVmYXVsdDpkZWZhdWx0In0.xqPTckVQOVzrP8VXVPeQw9Y9I9mAQ-1eGNp14xQkJKs9dJCN-3uxOBGS4VaL1Qk5N71RD7rIjC2HhgJ5YK1YBw" // notsecret
+
+	var backendAuth atomic.Value
+	s.MockServer.Handle(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if auth := r.Header.Get("Authorization"); auth != "" {
+			backendAuth.Store(auth)
+		}
+	}))
+
+	s.StaticConfig.SkipJWTVerification = true
+	s.StaticConfig.AuthorizationURL = ""
+	s.StaticConfig.OAuthAudience = "mcp-server"
+	s.StartServer()
+	s.StartClient(map[string]string{
+		"Authorization": "Bearer " + clusterIssuedToken,
+	})
+
+	s.Run("Initialize returns OK for cluster-issued JWT in passthrough mode", func() {
+		s.Require().NotNil(s.mcpClient.Session, "Expected session for passthrough with cluster-issued JWT — audience checks must be skipped")
+		s.Require().NotNil(s.mcpClient.Session.InitializeResult(), "Expected initial request to not be nil")
+	})
+	s.Run("Tool call forwards cluster-issued JWT to cluster", func() {
+		toolResult, err := s.mcpClient.Session.CallTool(s.T().Context(), &mcp.CallToolParams{
+			Name:      "events_list",
+			Arguments: map[string]any{},
+		})
+		s.Require().NoError(err, "Expected no error calling tool with cluster-issued JWT in passthrough mode")
+		s.Require().NotNil(toolResult, "Expected tool result to not be nil")
+	})
+	s.Run("Backend receives cluster-issued JWT unmodified", func() {
+		got, _ := backendAuth.Load().(string)
+		s.Require().NotEmpty(got, "Expected backend to receive an Authorization header")
+		s.Equal("Bearer "+clusterIssuedToken, got,
+			"Passthrough mode must forward cluster-issued JWTs unchanged; cluster validates audience")
+	})
+
+	s.mcpClient.Close()
+	s.mcpClient = nil
+	s.stopRunningServer()
+}
+
+// TestAuthorizationPassthroughOIDCPathUnaffected verifies that the passthrough
+// early return does NOT fire when authorization_url is set. With both
+// skip_jwt_verification=true and an OIDC server configured, an opaque token must
+// fall through to the normal JWT+OIDC validation path and be rejected.
+func (s *AuthorizationSuite) TestAuthorizationPassthroughOIDCPathUnaffected() {
+	oidcTestServer := NewOidcTestServer(s.T())
+	s.T().Cleanup(oidcTestServer.Close)
+
+	s.StaticConfig.SkipJWTVerification = true
+	s.StaticConfig.AuthorizationURL = oidcTestServer.URL
+	s.StaticConfig.OAuthAudience = "mcp-server"
+	s.OidcProvider = oidcTestServer.Provider
+	s.StartServer()
+
+	s.Run("Opaque token is rejected when authorization_url is set", func() {
+		resp := s.HttpGet("Bearer sha256~abc123openshifttoken")
+		s.T().Cleanup(func() { _ = resp.Body.Close() })
+		s.Equal(http.StatusUnauthorized, resp.StatusCode,
+			"Expected HTTP 401 for opaque token with authorization_url set — passthrough must not bypass OIDC validation")
+	})
+
+	s.stopRunningServer()
+}
+
+func TestAuthorization(t *testing.T) {
+	suite.Run(t, new(AuthorizationSuite))
+}

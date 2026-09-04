@@ -1,0 +1,117 @@
+{{ template "chart.header" . }}
+{{ template "chart.deprecationWarning" . }}
+
+{{ template "chart.badgesSection" . }}
+
+{{ template "chart.description" . }}
+
+{{ template "chart.homepageLine" . }}
+
+{{ template "chart.maintainersSection" . }}
+
+{{ template "chart.sourcesSection" . }}
+
+{{ template "chart.requirementsSection" . }}
+
+## Installing the Chart
+
+The Chart can be installed quickly and easily to a Kubernetes cluster. Since an _Ingress_ is added as part of the default install of the Chart, the `ingress.host` Value must be specified unless you disable Ingress and use another exposure mechanism (for example Gateway API; see below).
+
+Install the Chart using the following command from the root of this directory: 
+
+```shell
+helm upgrade -i -n kubernetes-mcp-server --create-namespace kubernetes-mcp-server oci://ghcr.io/containers/charts/kubernetes-mcp-server --set ingress.host=<hostname>
+```
+
+### Gateway API (HTTPRoute)
+
+If your platform uses [Gateway API](https://gateway.networking.k8s.io/) instead of classic Ingress, set `ingress.enabled` to `false` and enable `httpRoute` with `parentRefs`, `rules` (optional `matches`, `filters`, and `timeouts` are passed through), and optionally `hostnames`. The chart adds `backendRefs` pointing at the release `Service` and `service.port`. `parentRefs` and `hostnames` are rendered with `tpl` on their YAML so you can reference `Release` metadata in values. `httpRoute.parentRefs` is required when `httpRoute.enabled=true`; leaving it empty fails at `helm template` / `helm install` time.
+
+```yaml
+ingress:
+  enabled: false
+httpRoute:
+  enabled: true
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: my-gateway
+      namespace: gateway-system
+      sectionName: http
+  hostnames:
+    - mcp.example.com
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+```
+
+### Optimized OpenShift Deployment
+
+Functionality has been added to the Chart to simplify the deployment to OpenShift Cluster.
+
+### OpenShift with NetObserv
+
+To enable the [NetObserv toolset](https://github.com/containers/kubernetes-mcp-server/blob/main/docs/NETOBSERV.md) on OpenShift, use the example values file. The pod ServiceAccount authenticates to the Kubernetes API and the NetObserv console plugin (`cluster_auth_mode: kubeconfig`).
+
+```bash
+helm upgrade -i kubernetes-mcp-server oci://ghcr.io/containers/charts/kubernetes-mcp-server \
+  -n kubernetes-mcp-server --create-namespace \
+  -f examples/values-openshift-netobserv.yaml \
+  --set ingress.host=kubernetes-mcp-server.apps.<cluster-domain>
+```
+
+See [examples/README.md](examples/README.md) and [docs/NETOBSERV.md](https://github.com/containers/kubernetes-mcp-server/blob/main/docs/NETOBSERV.md) for RBAC (`view`) and configuration options.
+
+### RBAC Configuration
+
+The chart supports creating custom RBAC resources. Set `rbac.create: false` to disable all RBAC resource creation.
+
+To bind to an existing cluster role (e.g., `view`, `edit`, `admin`), use `roleRef.external: true`:
+
+```yaml
+rbac:
+  extraClusterRoleBindings:
+    - name: use-view-role
+      roleRef:
+        name: view
+        external: true
+```
+
+### Additional Containers (Sidecars)
+
+The chart supports adding additional containers to the deployment pod. These can be used for various purposes such as MCP proxying.
+
+To add extra containers, define them in the `extraContainers` value using standard Kubernetes container specifications:
+
+```yaml
+extraContainers:
+  - name: sidecar
+    image: quay.io/prometheus/busybox:latest
+    resources:
+      requests:
+        cpu: 10m
+        memory: 32Mi
+      limits:
+        cpu: 50m
+        memory: 64Mi
+  - name: metrics-exporter
+    image: quay.io/prometheus/prometheus:latest
+    ports:
+      - containerPort: 9090
+```
+
+Each container accepts any valid Kubernetes container field including `image`, `command`, `args`, `env`, `volumeMounts`, `resources`, `ports`, and more.
+
+{{ template "chart.valuesSection" . }}
+
+## Updating the README
+
+The contents of the README.md file is generated using [helm-docs](https://github.com/norwoodj/helm-docs). Whenever changes are introduced to the Chart and its _Values_, the documentation should be regenerated. 
+
+Execute the following command to regenerate the documentation from within the Helm Chart directory.
+
+```shell
+helm-docs -t README.md.gotmpl
+```

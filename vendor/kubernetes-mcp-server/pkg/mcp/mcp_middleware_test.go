@@ -1,0 +1,511 @@
+package mcp
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"strconv"
+	"testing"
+
+	"errors"
+
+	"github.com/containers/kubernetes-mcp-server/internal/test"
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/stretchr/testify/suite"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
+	"golang.org/x/time/rate"
+	"k8s.io/klog/v2"
+	"k8s.io/klog/v2/textlogger"
+)
+
+type McpLoggingSuite struct {
+	BaseMcpSuite
+	klogState klog.State
+	logBuffer test.SyncBuffer
+}
+
+func (s *McpLoggingSuite) SetupTest() {
+	s.BaseMcpSuite.SetupTest()
+	s.klogState = klog.CaptureState()
+}
+
+func (s *McpLoggingSuite) TearDownTest() {
+	s.BaseMcpSuite.TearDownTest()
+	s.klogState.Restore()
+}
+
+func (s *McpLoggingSuite) SetLogLevel(level int) {
+	flags := flag.NewFlagSet("test", flag.ContinueOnError)
+	klog.InitFlags(flags)
+	_ = flags.Set("v", strconv.Itoa(level))
+	klog.SetLogger(textlogger.NewLogger(textlogger.NewConfig(textlogger.Verbosity(level), textlogger.Output(&s.logBuffer))))
+}
+
+func (s *McpLoggingSuite) TestLogsToolCall() {
+	s.SetLogLevel(5)
+	s.InitMcpClient()
+	_, err := s.CallTool("configuration_view", map[string]any{"minified": false})
+	s.Require().NoError(err, "call to tool configuration_view failed")
+
+	s.Run("Logs tool name", func() {
+		s.Contains(s.logBuffer.String(), `mcp.tool_call.tool_name="configuration_view"`)
+	})
+	s.Run("Logs tool call arguments", func() {
+		s.Contains(s.logBuffer.String(), `mcp.tool_call.arguments="map[minified:false]"`)
+	})
+}
+
+func (s *McpLoggingSuite) TestLogsToolCallHeaders() {
+	s.SetLogLevel(7)
+	s.InitMcpClient(test.WithHTTPHeaders(map[string]string{
+		"Accept-Encoding":   "gzip",
+		"Authorization":     "Bearer should-not-be-logged",
+		"authorization":     "Bearer should-not-be-logged",
+		"a-loggable-header": "should-be-logged",
+	}))
+	_, err := s.CallTool("configuration_view", map[string]any{"minified": false})
+	s.Require().NoError(err, "call to tool configuration_view failed")
+
+	s.Run("Logs tool call headers", func() {
+		s.Contains(s.logBuffer.String(), "A-Loggable-Header: should-be-logged", "Expected log to contain loggable header")
+	})
+	sensitiveHeaders := []string{
+		"Authorization:",
+		// TODO: Add more sensitive headers as needed
+	}
+	s.Run("Does not log sensitive headers", func() {
+		for _, header := range sensitiveHeaders {
+			s.NotContains(s.logBuffer.String(), header, "Log should not contain sensitive header")
+		}
+	})
+	s.Run("Does not log sensitive header values", func() {
+		s.NotContains(s.logBuffer.String(), "should-not-be-logged", "Log should not contain sensitive header value")
+	})
+}
+
+// TestLogsRedactsSensitiveParams asserts that the V(6) protocol-receiving
+// middleware runs payloads through mcplog.Sanitize, so inline tokens / JWTs
+// embedded in tool arguments do not land in the log file in cleartext. The
+// raw JSON path is exercised via CallToolRaw — the go-sdk client would
+// otherwise strip unknown fields before they reach the wire.
+func (s *McpLoggingSuite) TestLogsRedactsSensitiveParams() {
+	s.SetLogLevel(6)
+	s.InitMcpClient()
+
+	jwt := "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NSJ9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+	rawParams := fmt.Sprintf(`{"name":"configuration_view","arguments":{"minified":false,"token":%q}}`, jwt)
+	resp := s.CallToolRaw(s.T(), rawParams)
+	s.Require().NotNil(resp, "expected raw tools/call to produce a response")
+	_ = resp.Body.Close()
+
+	s.Run("redacts JWT-shaped token in V(6) params dump", func() {
+		s.NotContains(s.logBuffer.String(), jwt, "raw JWT must not appear in protocol log")
+		// textlogger wraps the formatted message in quotes and escapes any
+		// inner quotes, so the JSON `"token":"[REDACTED]"` lands in the
+		// buffer as the literal `\"token\":\"[REDACTED]\"`.
+		s.Contains(s.logBuffer.String(), `\"token\":\"[REDACTED]\"`, `expected the "token" JSON field to be redacted`)
+	})
+}
+
+// TestLogsRedactsCustomAuthHeader asserts that a non-denylisted custom header
+// carrying a Bearer-shaped value still has the token value sanitized at V(7).
+// The header name itself is preserved (the denylist is a fast first cut; the
+// regex sweep is the safety net for vendor-specific schemes).
+func (s *McpLoggingSuite) TestLogsRedactsCustomAuthHeader() {
+	s.SetLogLevel(7)
+	bearerValue := "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature-bytes-here"
+	s.InitMcpClient(test.WithHTTPHeaders(map[string]string{
+		// Not in redactedHeaders, so the name flows through Header.WriteSubset.
+		"X-Custom-Auth": bearerValue,
+	}))
+	_, err := s.CallTool("configuration_view", map[string]any{"minified": false})
+	s.Require().NoError(err, "call to tool configuration_view failed")
+
+	s.Run("header name is logged", func() {
+		s.Contains(s.logBuffer.String(), "X-Custom-Auth:", "expected the non-denylisted header name to be visible")
+	})
+	s.Run("Bearer token value is redacted", func() {
+		s.NotContains(s.logBuffer.String(), "signature-bytes-here", "raw token must not appear in header log")
+		s.Contains(s.logBuffer.String(), "Bearer [REDACTED]", `expected "Bearer <token>" to be redacted by Sanitize`)
+	})
+}
+
+func TestMcpLogging(t *testing.T) {
+	suite.Run(t, new(McpLoggingSuite))
+}
+
+// TraceContextPropagationSuite tests the trace context propagation middleware
+type TraceContextPropagationSuite struct {
+	suite.Suite
+}
+
+func (s *TraceContextPropagationSuite) SetupTest() {
+	// Set up a global text map propagator for tests
+	// This is necessary because otel.GetTextMapPropagator() returns NoOp by default
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
+}
+
+// TestMetaCarrier tests the metaCarrier implementation of TextMapCarrier
+func (s *TraceContextPropagationSuite) TestMetaCarrier() {
+	s.Run("Get returns string value from meta", func() {
+		carrier := &metaCarrier{
+			meta: map[string]any{
+				"traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+				"tracestate":  "rojo=00f067aa0ba902b7",
+			},
+		}
+		s.Equal("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01", carrier.Get("traceparent"))
+		s.Equal("rojo=00f067aa0ba902b7", carrier.Get("tracestate"))
+	})
+
+	s.Run("Get returns empty string for missing key", func() {
+		carrier := &metaCarrier{meta: map[string]any{}}
+		s.Equal("", carrier.Get("traceparent"))
+	})
+
+	s.Run("Get returns empty string for non-string value", func() {
+		carrier := &metaCarrier{
+			meta: map[string]any{
+				"number": 123,
+				"bool":   true,
+			},
+		}
+		s.Equal("", carrier.Get("number"))
+		s.Equal("", carrier.Get("bool"))
+	})
+
+	s.Run("Keys returns all keys in meta", func() {
+		carrier := &metaCarrier{
+			meta: map[string]any{
+				"traceparent": "value1",
+				"tracestate":  "value2",
+				"other":       "value3",
+			},
+		}
+		keys := carrier.Keys()
+		s.Len(keys, 3)
+		s.Contains(keys, "traceparent")
+		s.Contains(keys, "tracestate")
+		s.Contains(keys, "other")
+	})
+
+	s.Run("Keys returns empty slice for empty meta", func() {
+		carrier := &metaCarrier{meta: map[string]any{}}
+		keys := carrier.Keys()
+		s.Empty(keys)
+	})
+}
+
+// TestTraceContextPropagationMiddleware tests the trace context propagation middleware
+func (s *TraceContextPropagationSuite) TestTraceContextPropagationMiddleware() {
+	s.Run("extracts trace context from CallToolParamsRaw", func() {
+		// Create a valid traceparent header (version 00, trace ID, span ID, flags)
+		traceparent := "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+		tracestate := "rojo=00f067aa0ba902b7"
+
+		params := &mcp.CallToolParamsRaw{
+			Meta: mcp.Meta{
+				"traceparent": traceparent,
+				"tracestate":  tracestate,
+			},
+		}
+
+		// Since we can't easily create mcp.Request due to sealed interfaces,
+		// let's test the carrier and extraction logic directly
+		carrier := &metaCarrier{meta: params.Meta}
+		ctx := otel.GetTextMapPropagator().Extract(context.Background(), carrier)
+
+		spanContext := trace.SpanContextFromContext(ctx)
+		s.True(spanContext.IsValid(), "Expected valid span context to be extracted")
+		s.True(spanContext.IsRemote(), "Expected span context to be marked as remote")
+
+		expectedTraceID, _ := trace.TraceIDFromHex("0af7651916cd43dd8448eb211c80319c")
+		s.Equal(expectedTraceID, spanContext.TraceID())
+
+		expectedSpanID, _ := trace.SpanIDFromHex("b7ad6b7169203331")
+		s.Equal(expectedSpanID, spanContext.SpanID())
+	})
+
+	s.Run("handles empty metadata gracefully", func() {
+		params := &mcp.CallToolParamsRaw{
+			Meta: mcp.Meta{},
+		}
+
+		carrier := &metaCarrier{meta: params.Meta}
+		ctx := otel.GetTextMapPropagator().Extract(context.Background(), carrier)
+
+		spanContext := trace.SpanContextFromContext(ctx)
+		s.False(spanContext.IsValid(), "Expected no trace context for empty metadata")
+	})
+
+	s.Run("handles nil metadata gracefully", func() {
+		params := &mcp.CallToolParamsRaw{
+			Meta: nil,
+		}
+
+		if len(params.Meta) > 0 {
+			carrier := &metaCarrier{meta: params.Meta}
+			ctx := otel.GetTextMapPropagator().Extract(context.Background(), carrier)
+
+			spanContext := trace.SpanContextFromContext(ctx)
+			s.False(spanContext.IsValid(), "Should not have extracted trace context")
+		}
+		// If meta is nil, we don't attempt extraction - this is the expected behavior
+		s.Nil(params.Meta, "Meta should be nil")
+	})
+}
+
+// TestTraceContextPropagationCarrierWithPropagator verifies that metaCarrier works with the actual propagator
+func (s *TraceContextPropagationSuite) TestTraceContextPropagationCarrierWithPropagator() {
+	s.Run("W3C TraceContext propagator can extract from metaCarrier", func() {
+		traceparent := "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+		tracestate := "rojo=00f067aa0ba902b7,congo=t61rcWkgMzE"
+
+		carrier := &metaCarrier{
+			meta: map[string]any{
+				"traceparent": traceparent,
+				"tracestate":  tracestate,
+			},
+		}
+
+		propagator := propagation.TraceContext{}
+		ctx := propagator.Extract(context.Background(), carrier)
+
+		spanContext := trace.SpanContextFromContext(ctx)
+		s.True(spanContext.IsValid(), "Propagator should extract valid span context")
+		s.True(spanContext.IsRemote(), "Extracted span should be marked as remote")
+
+		// Verify extracted values
+		expectedTraceID, _ := trace.TraceIDFromHex("0af7651916cd43dd8448eb211c80319c")
+		s.Equal(expectedTraceID, spanContext.TraceID())
+
+		expectedSpanID, _ := trace.SpanIDFromHex("b7ad6b7169203331")
+		s.Equal(expectedSpanID, spanContext.SpanID())
+
+		s.Equal("rojo=00f067aa0ba902b7,congo=t61rcWkgMzE", spanContext.TraceState().String())
+	})
+}
+
+func TestTraceContextPropagation(t *testing.T) {
+	suite.Run(t, new(TraceContextPropagationSuite))
+}
+
+// RateLimitingSuite tests the rateLimitingMiddleware
+type RateLimitingSuite struct {
+	BaseMcpSuite
+}
+
+func (s *RateLimitingSuite) TestRequestsWithinRateLimitSucceed() {
+	s.Run("multiple requests under the limit all succeed", func() {
+		s.Cfg.HTTP.RateLimitRPS = 100
+		s.Cfg.HTTP.RateLimitBurst = 100
+		s.InitMcpClient()
+
+		for i := 0; i < 5; i++ {
+			_, err := s.CallTool("configuration_view", map[string]any{"minified": false})
+			s.NoError(err)
+		}
+	})
+}
+
+func (s *RateLimitingSuite) TestRequestsExceedingRateLimitReturnError() {
+	s.Run("returns rate limit error after exceeding burst", func() {
+		s.Cfg.HTTP.RateLimitRPS = 0.001 // nearly zero replenishment
+		s.Cfg.HTTP.RateLimitBurst = 10
+		s.InitMcpClient()
+
+		var rateLimitErr error
+		for i := 0; i < 20; i++ {
+			_, err := s.CallTool("configuration_view", map[string]any{"minified": false})
+			if err != nil {
+				rateLimitErr = err
+				break
+			}
+		}
+		s.Require().Error(rateLimitErr, "Expected rate limit error after exceeding burst")
+		s.Contains(rateLimitErr.Error(), "rate limit exceeded")
+		var rpcErr *jsonrpc.Error
+		s.Require().True(errors.As(rateLimitErr, &rpcErr), "Expected error to be a jsonrpc.Error")
+		s.Equal(int64(CodeRateLimitExceeded), rpcErr.Code)
+	})
+}
+
+func (s *RateLimitingSuite) TestSeparateSessionsHaveIndependentLimits() {
+	s.Run("second session succeeds after first is exhausted", func() {
+		s.Cfg.HTTP.RateLimitRPS = 0.001
+		s.Cfg.HTTP.RateLimitBurst = 10
+		s.InitMcpClient()
+
+		// Create a second client against the same server
+		client2 := test.NewMcpClient(s.T(), s.mcpServer.ServeHTTP())
+		defer client2.Close()
+
+		// Exhaust rate limit on first session
+		for i := 0; i < 20; i++ {
+			_, err := s.CallTool("configuration_view", map[string]any{"minified": false})
+			if err != nil {
+				break
+			}
+		}
+
+		// Second session should still work (independent limiter)
+		_, err := client2.CallTool("configuration_view", map[string]any{"minified": false})
+		s.NoError(err, "Second session should have independent rate limit")
+	})
+}
+
+func (s *RateLimitingSuite) TestDisabledRateLimiting() {
+	s.Run("requests succeed when rate limiting is disabled", func() {
+		s.Cfg.HTTP.RateLimitRPS = 0
+		s.InitMcpClient()
+
+		for i := 0; i < 20; i++ {
+			_, err := s.CallTool("configuration_view", map[string]any{"minified": false})
+			s.NoError(err)
+		}
+	})
+}
+
+func (s *RateLimitingSuite) TestDefaultBurst() {
+	s.Run("requests succeed when burst is not specified", func() {
+		s.Cfg.HTTP.RateLimitRPS = 100
+		s.Cfg.HTTP.RateLimitBurst = 0 // should default to 10
+		s.InitMcpClient()
+
+		// Verify that requests succeed, confirming the default burst was applied
+		for i := 0; i < 5; i++ {
+			_, err := s.CallTool("configuration_view", map[string]any{"minified": false})
+			s.NoError(err)
+		}
+	})
+}
+
+func (s *RateLimitingSuite) TestSessionBypass() {
+	s.Run("empty session ID bypasses rate limiting", func() {
+		done := make(chan struct{})
+		defer close(done)
+		middleware := rateLimitingMiddleware(done, func() (rate.Limit, int) {
+			return rate.Limit(0.001), 1
+		})
+
+		called := 0
+		handler := middleware(func(_ context.Context, _ string, _ mcp.Request) (mcp.Result, error) {
+			called++
+			return nil, nil
+		})
+
+		req := &mcp.ServerRequest[*mcp.CallToolParamsRaw]{
+			Session: &mcp.ServerSession{},
+			Params:  &mcp.CallToolParamsRaw{},
+		}
+
+		for i := 0; i < 5; i++ {
+			_, err := handler(context.Background(), "tools/call", req)
+			s.NoError(err)
+		}
+		s.Equal(5, called)
+	})
+
+	s.Run("nil session bypasses rate limiting", func() {
+		done := make(chan struct{})
+		defer close(done)
+		middleware := rateLimitingMiddleware(done, func() (rate.Limit, int) {
+			return rate.Limit(0.001), 1
+		})
+
+		called := 0
+		handler := middleware(func(_ context.Context, _ string, _ mcp.Request) (mcp.Result, error) {
+			called++
+			return nil, nil
+		})
+
+		req := &mcp.ServerRequest[*mcp.CallToolParamsRaw]{
+			Params: &mcp.CallToolParamsRaw{},
+		}
+
+		for i := 0; i < 5; i++ {
+			_, err := handler(context.Background(), "tools/call", req)
+			s.NoError(err)
+		}
+		s.Equal(5, called)
+	})
+}
+
+func (s *RateLimitingSuite) TestConfigReloadTakesEffect() {
+	s.Run("reload with higher values allows more requests", func() {
+		s.Cfg.HTTP.RateLimitRPS = 0.001 // nearly zero replenishment
+		s.Cfg.HTTP.RateLimitBurst = 2
+		s.InitMcpClient()
+
+		// Exhaust the initial burst
+		for i := 0; i < 5; i++ {
+			_, _ = s.CallTool("configuration_view", map[string]any{"minified": false})
+		}
+
+		// Verify that we are rate limited
+		_, err := s.CallTool("configuration_view", map[string]any{"minified": false})
+		s.Require().Error(err, "Expected rate limit error")
+
+		// Reload with much higher limits
+		s.Cfg.HTTP.RateLimitRPS = 1000
+		s.Cfg.HTTP.RateLimitBurst = 1000
+
+		// After reload, requests should succeed
+		_, err = s.CallTool("configuration_view", map[string]any{"minified": false})
+		s.NoError(err, "Expected request to succeed after config reload")
+	})
+}
+
+func (s *RateLimitingSuite) TestDisabledToEnabled() {
+	s.Run("enabling rate limiting after starting disabled", func() {
+		s.Cfg.HTTP.RateLimitRPS = 0 // disabled
+		s.InitMcpClient()
+
+		// Requests should succeed when disabled
+		for i := 0; i < 20; i++ {
+			_, err := s.CallTool("configuration_view", map[string]any{"minified": false})
+			s.NoError(err)
+		}
+
+		// Enable rate limiting with tight burst
+		s.Cfg.HTTP.RateLimitRPS = 0.001
+		s.Cfg.HTTP.RateLimitBurst = 2
+
+		// Eventually should hit rate limit
+		var rateLimitErr error
+		for i := 0; i < 20; i++ {
+			_, err := s.CallTool("configuration_view", map[string]any{"minified": false})
+			if err != nil {
+				rateLimitErr = err
+				break
+			}
+		}
+		s.Require().Error(rateLimitErr, "Expected rate limit error after enabling")
+		s.Contains(rateLimitErr.Error(), "rate limit exceeded")
+	})
+}
+
+func (s *RateLimitingSuite) TestDoubleCloseDoesNotPanic() {
+	s.Run("calling Close twice does not panic", func() {
+		s.Cfg.HTTP.RateLimitRPS = 10
+		s.Cfg.HTTP.RateLimitBurst = 10
+		s.InitMcpClient()
+
+		s.NotPanics(func() {
+			s.mcpServer.Close()
+			s.mcpServer.Close()
+		})
+		// Prevent TearDownTest from closing again (already closed)
+		s.mcpServer = nil
+	})
+}
+
+func TestRateLimiting(t *testing.T) {
+	suite.Run(t, new(RateLimitingSuite))
+}

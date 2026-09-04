@@ -1,0 +1,117 @@
+package kubernetes
+
+import (
+	"context"
+
+	"github.com/containers/kubernetes-mcp-server/pkg/api"
+	"github.com/containers/kubernetes-mcp-server/pkg/oauth"
+	"github.com/containers/kubernetes-mcp-server/pkg/tokenexchange"
+)
+
+// McpReload is a function type that defines a callback for reloading MCP toolsets (including tools, prompts, or other configurations)
+type McpReload func() error
+
+// ManagerProvider provides access to the underlying Manager instances for each target.
+type ManagerProvider interface {
+	// GetTargetManagers returns managers for all targets.
+	// Returns an error if managers for any target cannot be retrieved.
+	GetTargetManagers(ctx context.Context) ([]*Manager, error)
+}
+
+type Provider interface {
+	// Embed the base TargetProvider and FilteringProvider interfaces
+	api.TargetProvider
+	api.FilteringProvider
+	// GetDerivedKubernetes returns a Kubernetes client for the specified target
+	GetDerivedKubernetes(ctx context.Context, target string) (*Kubernetes, error)
+	// WatchTargets sets up a watcher for changes in the cluster targets and calls the provided McpReload function when changes are detected
+	WatchTargets(ctx context.Context, reload McpReload)
+	Close()
+}
+
+// TokenExchangeProvider is an optional interface that providers can implement to suport per-target token exchange.
+//
+// When a provider implements this interface and GetTokenExchangeConfig returns a non-nil config for a target, token
+// exchange will be performed before creating the derived Kubernetes client. The exchanged token replaces the original
+// in the Authorization header used by the derived client.
+//
+// If GetTokenExchangeConfig returns nil for a target, or the interface is not implemented for a provider, no per-target
+// token exchange is performed and the original token is used as-is.
+type TokenExchangeProvider interface {
+	// GetTokenExchangeConfig returns the token exchange configuration for the specified target.
+	// Returns nil if no per-target exchange is configured
+	GetTokenExchangeConfig(target string) *tokenexchange.TargetTokenExchangeConfig
+
+	// GetTokenExchangeStrategy returns the token exchange strategy to use (e.g. "keycloak-v1" or "rfc8693").
+	GetTokenExchangeStrategy() string
+}
+
+type ProviderOption func(*providerOptions)
+
+type providerOptions struct {
+	oauthState         *oauth.State
+	baseConfigProvider func() api.BaseConfig
+}
+
+func WithTokenExchange(oauthState *oauth.State) ProviderOption {
+	return func(opts *providerOptions) {
+		opts.oauthState = oauthState
+	}
+}
+
+func WithBaseConfigProvider(baseConfigProvider func() api.BaseConfig) ProviderOption {
+	return func(opts *providerOptions) {
+		opts.baseConfigProvider = baseConfigProvider
+	}
+}
+
+func NewProvider(ctx context.Context, cfg api.BaseConfig, opts ...ProviderOption) (Provider, error) {
+	var providerOpts providerOptions
+	for _, opt := range opts {
+		opt(&providerOpts)
+	}
+
+	strategy := resolveStrategy(cfg)
+
+	factory, err := getProviderFactory(strategy)
+	if err != nil {
+		return nil, err
+	}
+
+	provider, err := factory(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	if providerOpts.oauthState != nil {
+		baseConfigProvider := providerOpts.baseConfigProvider
+		if baseConfigProvider == nil {
+			baseConfigProvider = func() api.BaseConfig {
+				return cfg
+			}
+		}
+		provider = newTokenExchangingProvider(
+			provider,
+			baseConfigProvider,
+			providerOpts.oauthState,
+		)
+	}
+
+	return provider, nil
+}
+
+func resolveStrategy(cfg api.BaseConfig) string {
+	if cfg.GetClusterProviderStrategy() != "" {
+		return cfg.GetClusterProviderStrategy()
+	}
+
+	if cfg.GetKubeConfigPath() != "" {
+		return api.ClusterProviderKubeConfig
+	}
+
+	if _, inClusterConfigErr := InClusterConfig(); inClusterConfigErr == nil {
+		return api.ClusterProviderInCluster
+	}
+
+	return api.ClusterProviderKubeConfig
+}

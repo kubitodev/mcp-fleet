@@ -1,0 +1,14 @@
+/talos-mcp
+/talos-mcp-server
+dist/
+.mcp.json
+/npm/*/bin/talos-mcp
+node_modules/
+.env
+.envrc
+.mcpregistry_*_token
+coverage.out
+.claire/
+.claude/worktrees/
+.claude/reviews/
+.claude/plans/

@@ -21,51 +21,44 @@ mcps:
   - name: talos-mcp-server
     upstream: https://github.com/Nosmoht/talos-mcp-server
     ref: v2.5.1
-    commit: ""
+    commit: "1d2f007ce1ec4dda875a8597c27b0b249d446abc"
     build: true
     dockerfile: dockerfiles/talos-mcp-server.Dockerfile
-
   # ── archive-only (upstream image is used directly) ──
-  - name: overseerr-mcp            # "seerr" MCP
+  - name: overseerr-mcp # "seerr" MCP
     upstream: https://github.com/jhomen368/overseerr-mcp
     ref: v2.3.0
-    commit: ""
+    commit: "aabc8647fe1a9d378b4f5ac7c5f4185bea89999b"
     build: false
     image: ghcr.io/jhomen368/overseerr-mcp:2.3.0
-
   - name: jellyfin-mcp
     upstream: https://github.com/jaredtrent/jellyfin-mcp
     ref: v2026.604.2
-    commit: ""
+    commit: "54af5a4fe47fa2c4a0d2df23f5e7dfeaec311176"
     build: false
     image: ghcr.io/jaredtrent/jellyfin-mcp:2026.604.2
-
   - name: immich-mcp
     upstream: https://github.com/barryw/ImmichMCP
     ref: v3.3.3
-    commit: ""
+    commit: "1fb31c38724ef5f80b348c7e1b103fdcce7a9142"
     build: false
     image: ghcr.io/barryw/immichmcp:v3.3.3
-
   - name: mcp-for-argocd
     upstream: https://github.com/argoproj-labs/mcp-for-argocd
     ref: v0.9.0
-    commit: ""
+    commit: "28d15ca69b0c31387cc6ec73d201fd13c5d22b6a"
     build: false
     image: ghcr.io/argoproj-labs/mcp-for-argocd:v0.9.0
-
   - name: kubernetes-mcp-server
     upstream: https://github.com/containers/kubernetes-mcp-server
     ref: v0.0.66
-    commit: ""
+    commit: "af2fe585c2807ea3e3179ccef3d9d820565b803d"
     build: false
     image: ghcr.io/containers/kubernetes-mcp-server:v0.0.66
-
   - name: mcp-victoriametrics
     upstream: https://github.com/VictoriaMetrics/mcp-victoriametrics
     ref: v1.20.2
-    commit: ""
+    commit: "fb45b04fbb93bdeda4ea7117ea50420a5ad4cb7e"
     build: false
     image: ghcr.io/victoriametrics/mcp-victoriametrics:v1.20.2
-
-  # navidrome-mcp: add when needed (Blakeem/Navidrome-MCP)
+# navidrome-mcp: add when needed (Blakeem/Navidrome-MCP)

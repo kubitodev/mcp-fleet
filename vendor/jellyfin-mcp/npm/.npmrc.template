@@ -1,0 +1,6 @@
+# Copy this to npm/.npmrc and fill in your npm token
+# Generate a token at: https://www.npmjs.com/settings/~/tokens
+#
+# This file is used by `make npm-publish` to authenticate with the registry.
+
+//registry.npmjs.org/:_authToken=YOUR_TOKEN_HERE

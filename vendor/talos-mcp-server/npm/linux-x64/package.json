@@ -1,0 +1,28 @@
+{
+  "name": "@talos-mcp/linux-x64",
+  "version": "0.22.0",
+  "description": "talos-mcp binary for Linux x64",
+  "license": "MIT",
+  "author": "Thomas Krahn",
+  "homepage": "https://github.com/Nosmoht/talos-mcp-server#readme",
+  "bugs": {
+    "url": "https://github.com/Nosmoht/talos-mcp-server/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Nosmoht/talos-mcp-server.git"
+  },
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "bin": {
+    "talos-mcp": "bin/talos-mcp"
+  },
+  "files": [
+    "bin/talos-mcp",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

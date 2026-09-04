@@ -1,0 +1,86 @@
+# Pull Request Pipeline - Build and test only
+when:
+  - event: pull_request
+
+labels:
+  platform: linux/amd64
+
+clone:
+  - name: clone
+    image: woodpeckerci/plugin-git
+    settings:
+      lfs: false
+      depth: 50
+
+steps:
+  # Validate the pull request title, which is what lands on main.
+  - name: commitlint
+    image: node:22-alpine
+    commands:
+      - npm install -g @commitlint/cli @commitlint/config-conventional
+      - |
+        echo "module.exports = { extends: ['@commitlint/config-conventional'] };" > commitlint.config.js
+      - |
+        set -eu
+
+        # Pull requests here are squash-merged, so individual commits are discarded
+        # and the title becomes the subject on main. That subject is what
+        # release.yml later parses to decide the version bump, so it is the thing
+        # worth enforcing. Woodpecker sets CI_COMMIT_MESSAGE to the PR title on
+        # pull_request events.
+        TITLE="${CI_COMMIT_MESSAGE:-}"
+        if [ -z "$TITLE" ]; then
+          echo "CI_COMMIT_MESSAGE is empty; cannot determine the pull request title"
+          exit 1
+        fi
+
+        SUBJECT=$(printf '%s\n' "$TITLE" | head -1)
+        echo "Checking pull request title: $SUBJECT"
+
+        if ! printf '%s\n' "$SUBJECT" | commitlint; then
+          echo
+          echo "The pull request title must be a conventional commit, for example:"
+          echo "  fix(tools): report the page size actually used"
+          echo "  feat(health): split liveness from readiness"
+          exit 1
+        fi
+
+        echo "Pull request title follows conventional commit format"
+
+  - name: build-and-test
+    image: mcr.microsoft.com/dotnet/sdk:10.0
+    commands:
+      - dotnet restore
+      - dotnet build -c Release
+      - dotnet test -c Release --logger "console;verbosity=detailed"
+    depends_on: [commitlint]
+
+  # Fail the PR if any package, direct or transitive, has a known advisory.
+  - name: vulnerability-audit
+    image: mcr.microsoft.com/dotnet/sdk:10.0
+    environment:
+      DOTNET_CLI_UI_LANGUAGE: en
+    commands:
+      - |
+        set +e
+        OUTPUT=$(dotnet list package --vulnerable --include-transitive 2>&1)
+        STATUS=$?
+        set -e
+        echo "$OUTPUT"
+
+        # Fail closed: a command that could not complete is not a clean audit.
+        if [ "$STATUS" -ne 0 ]; then
+          echo "dotnet list package did not complete cleanly (exit $STATUS); treating as a failed audit"
+          exit 1
+        fi
+
+        # Match only the phrasing used when something is actually vulnerable. A clean
+        # run prints "has no vulnerable packages given the current sources", so a looser
+        # match on "vulnerable packages" reports a finding on every green build.
+        if echo "$OUTPUT" | grep -q "has the following vulnerable packages"; then
+          echo "Vulnerable NuGet packages detected"
+          exit 1
+        fi
+
+        echo "No known vulnerable packages"
+    depends_on: [commitlint]

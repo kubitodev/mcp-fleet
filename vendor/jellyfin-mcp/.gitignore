@@ -1,0 +1,43 @@
+# Go build output
+/jellyfin-mcp
+build/
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go workspace
+go.work
+go.work.sum
+
+# npm package — compiled binary (built by `make build`)
+npm/jellyfin-mcp/bin/
+npm/.npmrc
+
+# Environment & secrets
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# Claude Code
+.claude/
+CLAUDE.md
+
+# README backup (full version with unverified client configs)
+README.full.md
+
+# Internal release docs
+RELEASING.md

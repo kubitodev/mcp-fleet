@@ -1,0 +1,448 @@
+package mcp
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+	"golang.org/x/time/rate"
+
+	"github.com/containers/kubernetes-mcp-server/pkg/klogutil"
+	internalk8s "github.com/containers/kubernetes-mcp-server/pkg/kubernetes"
+	"github.com/containers/kubernetes-mcp-server/pkg/mcplog" //nolint:staticcheck // MCP logging deprecated (SEP-2577)
+	"github.com/containers/kubernetes-mcp-server/pkg/telemetry"
+)
+
+// redactedHeaders lists the request header names that protocolReceivingMiddleware
+// must exclude from V(7) dumps. Header.WriteSubset treats true as "exclude",
+// so any name set here is redacted; everything else is logged verbatim.
+//
+// SECURITY: This is a denylist, not an allowlist — uncommon auth schemes
+// (e.g. a vendor-specific X-Foo-Auth header) will leak. Operators enabling
+// log_level >= 7 should treat the log file as a credential.
+var redactedHeaders = map[string]bool{
+	// Standard HTTP authentication channels.
+	"Authorization":       true,
+	"authorization":       true,
+	"Proxy-Authorization": true,
+	"proxy-authorization": true,
+	"Cookie":              true,
+	"cookie":              true,
+	// Common API gateway / token-auth conventions.
+	"X-Api-Key":    true,
+	"x-api-key":    true,
+	"X-Auth-Token": true,
+	"x-auth-token": true,
+	// Project-specific kubernetes auth header forwarded by HTTP middleware.
+	string(internalk8s.CustomAuthorizationHeader): true,
+}
+
+// protocolReceivingMiddleware logs inbound MCP method calls (client → server)
+// at V(6) and tool-call details at V(5)/V(7). It is the receiving half of
+// the protocol-logging pair; protocolSendingMiddleware handles outbound.
+//
+// Every payload, header buffer, and error string is passed through
+// mcplog.Sanitize before reaching klog so that inline Bearer tokens, JWTs,
+// JSON "token"/"secret"/"password" fields, and other secret-shaped strings
+// are redacted. This is best-effort (denylist + regex) — see docs/logging.md.
+func protocolReceivingMiddleware(next mcp.MethodHandler) mcp.MethodHandler {
+	return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+		rawParams := req.GetParams()
+		logger := klogutil.FromContext(ctx)
+		// Gate the JSON marshal explicitly: Info's args are evaluated
+		// before the V(6) check, so an unguarded jsonCompact(rawParams)
+		// would marshal every request even at the default log_level=0.
+		if logger.V(6).Enabled() {
+			logger.V(6).Info("mcp protocol", "mcp.client.method", method, "mcp.params", mcplog.Sanitize(jsonCompact(rawParams)))
+		}
+		if params, ok := rawParams.(*mcp.CallToolParamsRaw); ok && logger.V(5).Enabled() {
+			// Same gating rationale as the V(6) block above: the per-tool
+			// conversion and the per-header buffer build run before the
+			// V() check unless we short-circuit explicitly.
+			var attributes []any
+
+			if toolCallRequest, err := GoSdkToolCallParamsToToolCallRequest(params); err == nil {
+				attributes = append(attributes,
+					"mcp.tool_call.tool_name", toolCallRequest.Name,
+					"mcp.tool_call.arguments", mcplog.Sanitize(fmt.Sprintf("%v", toolCallRequest.GetArguments())),
+				)
+			}
+
+			if logger.V(7).Enabled() && req.GetExtra() != nil && req.GetExtra().Header != nil {
+				buffer := bytes.NewBuffer(make([]byte, 0))
+				if err := req.GetExtra().Header.WriteSubset(buffer, redactedHeaders); err == nil {
+					attributes = append(attributes,
+						"mcp.tool_call.headers", mcplog.Sanitize(buffer.String()),
+					)
+				}
+			}
+
+			logger.V(5).Info("mcp tool call", attributes...)
+		}
+		result, err := next(ctx, method, req)
+		if err != nil {
+			// Field (not Err) so the error is routed through mcplog.Sanitize; Err would log the raw err.Error().
+			klogutil.LogInfo(logger.V(6), "mcp protocol", klogutil.Field("mcp.client.method", method), klogutil.Field("exception.message", mcplog.Sanitize(fmt.Sprintf("%v", err))))
+		} else if logger.V(6).Enabled() {
+			logger.V(6).Info("mcp protocol", "mcp.client.method", method, "mcp.call.result", mcplog.Sanitize(jsonCompact(result)))
+		}
+		return result, err
+	}
+}
+
+// protocolSendingMiddleware logs outbound MCP traffic (server → client) at
+// V(6). It is the counterpart to protocolReceivingMiddleware and exists
+// because server-initiated frames (logging notifications, list_changed
+// notifications, progress, server-side pings) bypass the receiving path
+// entirely. Without it, only the request half of every exchange would be
+// visible — which is exactly the gap stdio-mode debugging hits.
+//
+// Sanitization is applied identically to the receiving path.
+func protocolSendingMiddleware(next mcp.MethodHandler) mcp.MethodHandler {
+	return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+		logger := klogutil.FromContext(ctx)
+		if logger.V(6).Enabled() {
+			logger.V(6).Info("mcp protocol", "mcp.server.method", method, "mcp.params", mcplog.Sanitize(jsonCompact(req.GetParams())))
+		}
+		result, err := next(ctx, method, req)
+		if err != nil {
+			// Field (not Err) so the error is routed through mcplog.Sanitize; Err would log the raw err.Error().
+			klogutil.LogInfo(logger.V(6), "mcp protocol", klogutil.Field("mcp.server.method", method), klogutil.Field("exception.message", mcplog.Sanitize(fmt.Sprintf("%v", err))))
+		} else if result != nil && logger.V(6).Enabled() {
+			// Notifications return nil result; only requests have one.
+			logger.V(6).Info("mcp protocol", "mcp.server.method", method, "mcp.call.result", mcplog.Sanitize(jsonCompact(result)))
+		}
+		return result, err
+	}
+}
+
+// jsonCompact marshals v to compact JSON for protocol logging.
+// Falls back to fmt.Sprintf on marshal failure.
+func jsonCompact(v any) string {
+	if v == nil {
+		return "<nil>"
+	}
+	data, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Sprintf("%+v", v)
+	}
+	return string(data)
+}
+
+// sessionInjectionMiddleware injects the MCP session into the context for logging support.
+// This middleware should be added first so all subsequent middleware and handlers have access.
+func sessionInjectionMiddleware(next mcp.MethodHandler) mcp.MethodHandler {
+	return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+		if session := req.GetSession(); session != nil {
+			if serverSession, ok := session.(*mcp.ServerSession); ok {
+				ctx = context.WithValue(ctx, mcplog.MCPSessionContextKey, serverSession)
+			}
+		}
+		return next(ctx, method, req)
+	}
+}
+
+func authHeaderPropagationMiddleware(next mcp.MethodHandler) mcp.MethodHandler {
+	return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+		if req.GetExtra() != nil && req.GetExtra().Header != nil {
+			// Get the standard Authorization header (OAuth compliant)
+			authHeader := req.GetExtra().Header.Get(string(internalk8s.OAuthAuthorizationHeader))
+			if authHeader != "" {
+				return next(context.WithValue(ctx, internalk8s.OAuthAuthorizationHeader, authHeader), method, req)
+			}
+
+			// Fallback to custom header for backward compatibility
+			customAuthHeader := req.GetExtra().Header.Get(string(internalk8s.CustomAuthorizationHeader))
+			if customAuthHeader != "" {
+				return next(context.WithValue(ctx, internalk8s.OAuthAuthorizationHeader, customAuthHeader), method, req)
+			}
+		}
+
+		// If no auth header in RequestExtra, context may already have it from HTTP middleware
+		// (used by SSE transport where HTTP headers aren't propagated to RequestExtra)
+		return next(ctx, method, req)
+	}
+}
+
+func userAgentPropagationMiddleware(serverName, serverVersion string) func(mcp.MethodHandler) mcp.MethodHandler {
+	return func(next mcp.MethodHandler) mcp.MethodHandler {
+		return func(ctx context.Context, method string, req mcp.Request) (result mcp.Result, err error) {
+			userAgentHeader := strings.TrimSpace(fmt.Sprintf(
+				"%s/%s (%s/%s) %s",
+				serverName,
+				serverVersion,
+				runtime.GOOS,
+				runtime.GOARCH,
+				getMcpReqUserAgent(req),
+			))
+			return next(context.WithValue(ctx, internalk8s.UserAgentHeader, userAgentHeader), method, req)
+		}
+	}
+}
+
+// traceContextPropagationMiddleware extracts distributed trace context from MCP request metadata
+// and propagates it into the Go context. This enables distributed tracing across MCP protocol boundaries.
+//
+// The traceparent and tracestate headers should be propagated through the _meta field in MCP requests.
+func traceContextPropagationMiddleware(next mcp.MethodHandler) mcp.MethodHandler {
+	return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+		// Skip trace context extraction if telemetry is not enabled
+		if !telemetry.Enabled() {
+			return next(ctx, method, req)
+		}
+
+		logger := klogutil.FromContext(ctx)
+
+		// Extract trace context from request params metadata
+		if params := req.GetParams(); params != nil {
+			if callParams, ok := params.(interface{ GetMeta() map[string]any }); ok {
+				// GetMeta() can panic on some MCP message types when metadata is not set
+				// (e.g., InitializedParams with nil Meta field). Recover gracefully.
+				var meta map[string]any
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							logger.V(7).Info("GetMeta() panicked (metadata not set)", "recover.value", r)
+						}
+					}()
+					meta = callParams.GetMeta()
+				}()
+
+				if len(meta) > 0 {
+					carrier := &metaCarrier{meta: meta}
+
+					// Compare span context before and after extraction to verify it worked
+					scBefore := trace.SpanContextFromContext(ctx)
+					ctx = otel.GetTextMapPropagator().Extract(ctx, carrier)
+					scAfter := trace.SpanContextFromContext(ctx)
+
+					if scAfter.IsValid() && !scAfter.Equal(scBefore) {
+						logger.V(6).Info("Extracted trace context from MCP request",
+							"trace_id", scAfter.TraceID(),
+							"span_id", scAfter.SpanID(),
+						)
+					}
+				}
+			}
+		}
+
+		return next(ctx, method, req)
+	}
+}
+
+// tracingMiddleware creates OpenTelemetry spans for MCP method calls.
+// This wraps the method execution so that child spans created during execution
+// are properly parented to this span.
+func tracingMiddleware(tracerName string) func(mcp.MethodHandler) mcp.MethodHandler {
+	tracer := otel.Tracer(tracerName)
+
+	return func(next mcp.MethodHandler) mcp.MethodHandler {
+		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+			// Skip all tracing work if telemetry is not enabled
+			if !telemetry.Enabled() {
+				return next(ctx, method, req)
+			}
+
+			transport := "pipe"
+			if req.GetExtra() != nil && req.GetExtra().Header != nil {
+				transport = "tcp"
+			}
+
+			spanName := method
+			attrs := []attribute.KeyValue{
+				attribute.String("mcp.method.name", method),
+				attribute.String("rpc.jsonrpc.version", "2.0"),
+				attribute.String("network.transport", transport),
+			}
+
+			if method == "tools/call" {
+				if params, ok := req.GetParams().(*mcp.CallToolParamsRaw); ok {
+					if toolReq, _ := GoSdkToolCallParamsToToolCallRequest(params); toolReq != nil {
+						spanName = method + " " + toolReq.Name
+						attrs = append(attrs, attribute.String("gen_ai.tool.name", toolReq.Name))
+						attrs = append(attrs, attribute.String("gen_ai.operation.name", "execute_tool"))
+					}
+				}
+			}
+
+			ctx, span := tracer.Start(ctx, spanName,
+				trace.WithSpanKind(trace.SpanKindServer),
+				trace.WithAttributes(attrs...),
+			)
+			defer span.End()
+
+			result, err := next(ctx, method, req)
+
+			if err != nil {
+				span.RecordError(err)
+				span.SetStatus(codes.Error, err.Error())
+				// Conditional: Error type classification
+				span.SetAttributes(attribute.String("error.type", "_OTHER"))
+			} else {
+				if callResult, ok := result.(*mcp.CallToolResult); ok && callResult.IsError {
+					span.SetStatus(codes.Error, "tool execution failed")
+					span.SetAttributes(attribute.String("error.type", "tool_error"))
+				} else {
+					span.SetStatus(codes.Ok, "")
+				}
+			}
+
+			return result, err
+		}
+	}
+}
+
+func getMcpReqUserAgent(req mcp.Request) string {
+	if req.GetExtra() != nil && req.GetExtra().Header != nil {
+		userAgentHeader := req.GetExtra().Header.Get(string(internalk8s.UserAgentHeader))
+		if userAgentHeader != "" {
+			return userAgentHeader
+		}
+	}
+
+	// fallback to constructing user agent from mcp client info
+	session, ok := req.GetSession().(*mcp.ServerSession)
+	if !ok {
+		return ""
+	}
+	initParams := session.InitializeParams()
+	if initParams == nil || initParams.ClientInfo == nil || (initParams.ClientInfo.Name == "" && initParams.ClientInfo.Version == "") {
+		return ""
+	}
+	return fmt.Sprintf("%s/%s", initParams.ClientInfo.Name, initParams.ClientInfo.Version)
+}
+
+// CodeRateLimitExceeded is the JSON-RPC error code returned when a session
+// exceeds its rate limit. The value -32029 echoes HTTP 429 and does not
+// conflict with standard JSON-RPC codes or existing SDK application codes.
+const CodeRateLimitExceeded = -32029
+
+// rateLimitingMiddleware creates a per-session rate limiting middleware.
+// Each session gets its own rate.Limiter keyed by session ID.
+// Requests with an empty session ID (e.g. STDIO transport before initialization) bypass rate limiting.
+// Stale session entries are reaped periodically to prevent unbounded memory growth.
+//
+// The configFn is called on every request to obtain the current rate limit and
+// burst values, making the middleware safe for dynamic configuration reloads.
+// When the returned limit is <= 0 the request is passed through (rate limiting
+// disabled). When the returned values differ from the previously observed ones
+// all existing per-session limiters are discarded so the new settings take
+// effect immediately.
+func rateLimitingMiddleware(done <-chan struct{}, configFn func() (rate.Limit, int)) mcp.Middleware {
+	var (
+		mu           sync.Mutex
+		limiters     = make(map[string]*rateLimiterEntry)
+		currentLimit rate.Limit
+		currentBurst int
+	)
+
+	// Reap stale sessions every 5 minutes
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				mu.Lock()
+				now := time.Now()
+				for id, entry := range limiters {
+					if now.Sub(entry.lastSeen) > 10*time.Minute {
+						delete(limiters, id)
+					}
+				}
+				mu.Unlock()
+			}
+		}
+	}()
+
+	return func(next mcp.MethodHandler) mcp.MethodHandler {
+		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+			limit, burst := configFn()
+
+			// When limit <= 0, rate limiting is disabled — pass through
+			if limit <= 0 {
+				return next(ctx, method, req)
+			}
+
+			session, ok := req.GetSession().(*mcp.ServerSession)
+			if !ok || session == nil {
+				return next(ctx, method, req)
+			}
+			sessionID := session.ID()
+			if sessionID == "" {
+				return next(ctx, method, req)
+			}
+
+			mu.Lock()
+			// If config changed, discard all existing limiters
+			if limit != currentLimit || burst != currentBurst {
+				clear(limiters)
+				currentLimit = limit
+				currentBurst = burst
+			}
+			entry, ok := limiters[sessionID]
+			if !ok {
+				entry = &rateLimiterEntry{
+					limiter:  rate.NewLimiter(limit, burst),
+					lastSeen: time.Now(),
+				}
+				limiters[sessionID] = entry
+			} else {
+				entry.lastSeen = time.Now()
+			}
+			mu.Unlock()
+
+			if !entry.limiter.Allow() {
+				return nil, &jsonrpc.Error{Code: CodeRateLimitExceeded, Message: "rate limit exceeded"}
+			}
+			return next(ctx, method, req)
+		}
+	}
+}
+
+type rateLimiterEntry struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
+}
+
+// metaCarrier adapts an MCP Meta map to the OpenTelemetry TextMapCarrier interface
+type metaCarrier struct {
+	meta map[string]any
+}
+
+// Get retrieves a value from the metadata map
+func (c *metaCarrier) Get(key string) string {
+	if val, ok := c.meta[key]; ok {
+		if str, ok := val.(string); ok {
+			return str
+		}
+	}
+	return ""
+}
+
+// Set is a no-op for extraction (only used for injection)
+func (c *metaCarrier) Set(key, value string) {
+	// Not used during extraction
+}
+
+// Keys returns all keys in the metadata map
+func (c *metaCarrier) Keys() []string {
+	keys := make([]string, 0, len(c.meta))
+	for k := range c.meta {
+		keys = append(keys, k)
+	}
+	return keys
+}

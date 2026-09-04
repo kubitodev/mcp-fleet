@@ -1,0 +1,241 @@
+package http
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"slices"
+	"strings"
+	"sync"
+
+	"github.com/coreos/go-oidc/v3/oidc"
+	"github.com/go-jose/go-jose/v4"
+	"github.com/go-jose/go-jose/v4/jwt"
+
+	"github.com/containers/kubernetes-mcp-server/pkg/config"
+	"github.com/containers/kubernetes-mcp-server/pkg/klogutil"
+	internalk8s "github.com/containers/kubernetes-mcp-server/pkg/kubernetes"
+	"github.com/containers/kubernetes-mcp-server/pkg/oauth"
+)
+
+// write401 sends a 401/Unauthorized response with WWW-Authenticate header.
+func write401(w http.ResponseWriter, wwwAuthenticateHeader, errorType, message string) {
+	w.Header().Set("WWW-Authenticate", wwwAuthenticateHeader+fmt.Sprintf(`, error="%s"`, errorType))
+	http.Error(w, message, http.StatusUnauthorized)
+}
+
+// AuthorizationMiddleware validates the OAuth flow for protected resources.
+//
+// The flow is skipped for unprotected resources, such as health checks and well-known endpoints.
+//
+//	There are several auth scenarios supported by this middleware:
+//
+//	 1. requireOAuth is false:
+//
+//	    - The OAuth flow is skipped, and the server is effectively unprotected.
+//	    - The request is passed to the next handler without any validation.
+//
+//	    see TestAuthorizationRequireOAuthFalse
+//
+//	 2. requireOAuth is set to true, server is protected:
+//
+//	    2.1. Token Passthrough mode (oidcProvider is nil, SkipJWTVerification is true):
+//	         - The token is forwarded directly to the cluster without ANY local validation.
+//	         - No JWT parsing, no expiration/audience checks, no signature verification.
+//			 - The cluster (or upstream reverse proxy) is the sole authority for validating the token.
+//			 - Use this mode for non-JWT tokens (ex. OpenShift sha256 tokens) or if delegating to cluster RBAC.
+//
+//	         see TestAuthorizationPassthroughOpaqueToken
+//
+//	    2.2. OIDC Provider Validation (oidcProvider is not nil):
+//	         - The token is validated offline for basic sanity checks (audience and expiration).
+//	         - If OAuthAudience is set, the token is validated against the audience.
+//	         - The token is then validated against the OIDC Provider.
+//
+//	         see TestAuthorizationOidcToken
+func AuthorizationMiddleware(cfgState *config.StaticConfigState, oauthState *oauth.State) func(http.Handler) http.Handler {
+	var skipJWTWarningOnce sync.Once
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			logger := klogutil.FromContext(r.Context())
+			// Skip auth for infrastructure endpoints (health, metrics) and well-known endpoints
+			if slices.Contains(infraPaths, r.URL.Path) || isWellKnownPath(r.URL.EscapedPath()) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			// Load the latest config snapshot on every request so that
+			// SIGHUP-reloaded auth settings take effect immediately.
+			staticConfig := cfgState.Load()
+			if !staticConfig.RequireOAuth {
+				// Always extract the Authorization header so it can be forwarded
+				// to the cluster, even without OAuth validation.
+				if authHeader := r.Header.Get("Authorization"); authHeader != "" && strings.HasPrefix(authHeader, "Bearer ") {
+					ctx := context.WithValue(r.Context(), internalk8s.OAuthAuthorizationHeader, authHeader)
+					next.ServeHTTP(w, r.WithContext(ctx))
+					return
+				}
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			wwwAuthenticateHeader := "Bearer realm=\"Kubernetes MCP Server\""
+			if staticConfig.OAuthAudience != "" {
+				wwwAuthenticateHeader += fmt.Sprintf(`, audience="%s"`, staticConfig.OAuthAudience)
+			}
+
+			authHeader := r.Header.Get("Authorization")
+			if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
+				logger.V(1).Info("Authentication failed - missing or invalid bearer token",
+					"http.request.method", r.Method,
+					"url.path", r.URL.Path,
+					"client.address", r.RemoteAddr,
+				)
+				write401(w, wwwAuthenticateHeader, "missing_token", "Unauthorized: Bearer token required")
+				return
+			}
+
+			token := strings.TrimPrefix(authHeader, "Bearer ")
+
+			// Empty token check post-trimming
+			if token == "" {
+				logger.V(1).Info("Authentication failed - empty bearer token",
+					"http.request.method", r.Method,
+					"url.path", r.URL.Path,
+					"client.address", r.RemoteAddr,
+				)
+				write401(w, wwwAuthenticateHeader, "invalid_token", "Unauthorized: Bearer token is empty")
+				return
+			}
+
+			// Token passthrough, skips all JWT processing
+			// Cluster is the sole authority for validating token (ex. sha256 token with OpenShift)
+			if staticConfig.SkipJWTVerification && staticConfig.AuthorizationURL == "" {
+				skipJWTWarningOnce.Do(func() {
+					klogutil.LogWarn(logger, "Bearer token forwarded without local validation (skip_jwt_verification=true and no authorization_url) - the cluster is the sole authority")
+				})
+				ctx := context.WithValue(r.Context(), internalk8s.OAuthAuthorizationHeader, authHeader)
+				next.ServeHTTP(w, r.WithContext(ctx))
+				return
+			}
+
+			claims, err := ParseJWTClaims(token)
+			if err == nil && claims == nil {
+				// Impossible case, but just in case
+				err = fmt.Errorf("failed to parse JWT claims from token")
+			}
+			// Offline validation
+			if err == nil {
+				err = claims.ValidateOffline(staticConfig.OAuthAudience)
+			}
+			// Online OIDC provider validation
+			if err == nil {
+				snapshot := oauthState.Load()
+				if snapshot == nil || snapshot.OIDCProvider == nil {
+					// Provider was configured (authorization_url set) but is unavailable — reject
+					if staticConfig.AuthorizationURL != "" {
+						logger.V(1).Info("Authentication rejected - OIDC provider unavailable",
+							"http.request.method", r.Method,
+							"url.path", r.URL.Path,
+							"client.address", r.RemoteAddr,
+						)
+						write401(w, wwwAuthenticateHeader, "temporarily_unavailable", "OIDC provider is not available")
+						return
+					}
+
+					// No provider configured - require explicit opt-in via skip_jwt_verification
+					// We can only reach this if skip_jwt_verification is false
+					logger.V(1).Info("Authentication rejected - JWT verification not configured",
+						"http.request.method", r.Method,
+						"url.path", r.URL.Path,
+						"client.address", r.RemoteAddr,
+					)
+					http.Error(w, "JWT verification not configured - set authorization_url or skip_jwt_verification", http.StatusInternalServerError)
+					return
+				} else {
+					err = claims.ValidateWithProvider(r.Context(), staticConfig.OAuthAudience, snapshot.OIDCProvider)
+				}
+			}
+			if err != nil {
+				klogutil.LogInfo(logger.V(1), "Authentication failed - JWT validation error",
+					klogutil.Field("http.request.method", r.Method),
+					klogutil.Field("url.path", r.URL.Path),
+					klogutil.Field("client.address", r.RemoteAddr),
+					klogutil.Err(err),
+				)
+				write401(w, wwwAuthenticateHeader, "invalid_token", "Unauthorized: Invalid token")
+				return
+			}
+
+			// Store the validated Authorization header in context for MCP handlers
+			// This is necessary because SSE transport doesn't propagate HTTP headers to MCP requests
+			ctx := context.WithValue(r.Context(), internalk8s.OAuthAuthorizationHeader, authHeader)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+var allSignatureAlgorithms = []jose.SignatureAlgorithm{
+	jose.EdDSA,
+	jose.HS256,
+	jose.HS384,
+	jose.HS512,
+	jose.RS256,
+	jose.RS384,
+	jose.RS512,
+	jose.ES256,
+	jose.ES384,
+	jose.ES512,
+	jose.PS256,
+	jose.PS384,
+	jose.PS512,
+}
+
+type JWTClaims struct {
+	jwt.Claims
+	Token string `json:"-"`
+	Scope string `json:"scope,omitempty"`
+}
+
+func (c *JWTClaims) GetScopes() []string {
+	if c.Scope == "" {
+		return nil
+	}
+	return strings.Fields(c.Scope)
+}
+
+// ValidateOffline Checks if the JWT claims are valid and if the audience matches the expected one.
+func (c *JWTClaims) ValidateOffline(audience string) error {
+	expected := jwt.Expected{}
+	if audience != "" {
+		expected.AnyAudience = jwt.Audience{audience}
+	}
+	if err := c.Validate(expected); err != nil {
+		return fmt.Errorf("JWT token validation error: %w", err)
+	}
+	return nil
+}
+
+// ValidateWithProvider validates the JWT claims against the OIDC provider.
+func (c *JWTClaims) ValidateWithProvider(ctx context.Context, audience string, provider *oidc.Provider) error {
+	if provider != nil {
+		verifier := provider.Verifier(&oidc.Config{
+			ClientID: audience,
+		})
+		_, err := verifier.Verify(ctx, c.Token)
+		if err != nil {
+			return fmt.Errorf("OIDC token validation error: %w", err)
+		}
+	}
+	return nil
+}
+
+func ParseJWTClaims(token string) (*JWTClaims, error) {
+	tkn, err := jwt.ParseSigned(token, allSignatureAlgorithms)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse JWT token: %w", err)
+	}
+	claims := &JWTClaims{}
+	err = tkn.UnsafeClaimsWithoutVerification(claims)
+	claims.Token = token
+	return claims, err
+}

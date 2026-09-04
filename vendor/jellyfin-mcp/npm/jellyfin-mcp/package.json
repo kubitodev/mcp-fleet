@@ -1,0 +1,23 @@
+{
+  "name": "@jaredtrent/jellyfin-mcp",
+  "version": "2026.604.2",
+  "description": "MCP server for Jellyfin media server",
+  "bin": {
+    "jellyfin-mcp": "bin/jellyfin-mcp"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jaredtrent/jellyfin-mcp.git"
+  }
+}

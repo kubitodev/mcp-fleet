@@ -1,0 +1,57 @@
+version: 2
+
+builds:
+  - main: ./cmd/talos-mcp
+    binary: talos-mcp
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+
+archives:
+  - formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+signs:
+  - cmd: cosign
+    signature: "${artifact}.sigstore.json"
+    args:
+      - sign-blob
+      - "--bundle=${signature}"
+      - "${artifact}"
+      - "--yes"
+    artifacts: checksum
+
+sboms:
+  - artifacts: archive
+
+changelog:
+  # Excludes use the [(:] character class so each anchor matches both unscoped
+  # ("docs:") and scoped ("docs(agents):") commit subjects. Breaking variants
+  # ("docs!:") are deliberately NOT excluded — those are rare and a BREAKING
+  # CHANGE footer should always surface in the release notes.
+  sort: asc
+  filters:
+    exclude:
+      - "^docs[(:]"
+      - "^test[(:]"
+      - "^ci[(:]"
+      - "^chore[(:]"
+      - "^build[(:]"
+      - "^style[(:]"
+      - "^revert[(:]"

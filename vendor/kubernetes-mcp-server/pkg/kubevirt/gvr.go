@@ -1,0 +1,146 @@
+package kubevirt
+
+import (
+	"context"
+
+	"github.com/containers/kubernetes-mcp-server/pkg/api"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+)
+
+// Scheme is the runtime scheme for KubeVirt resources
+var Scheme = runtime.NewScheme()
+
+// KubeVirt core resources
+var (
+	// VirtualMachineGVK is the GroupVersionKind for VirtualMachine resources
+	VirtualMachineGVK = schema.GroupVersionKind{
+		Group:   "kubevirt.io",
+		Version: "v1",
+		Kind:    "VirtualMachine",
+	}
+
+	// VirtualMachineGVR is the GroupVersionResource for VirtualMachine resources
+	VirtualMachineGVR = schema.GroupVersionResource{
+		Group:    "kubevirt.io",
+		Version:  "v1",
+		Resource: "virtualmachines",
+	}
+
+	// VirtualMachineInstanceGVR is the GroupVersionResource for VirtualMachineInstance resources
+	VirtualMachineInstanceGVR = schema.GroupVersionResource{
+		Group:    "kubevirt.io",
+		Version:  "v1",
+		Resource: "virtualmachineinstances",
+	}
+
+	// VirtualMachineInstanceSubresourcesGVR is the GroupVersionResource for VirtualMachineInstance subresources
+	VirtualMachineInstanceSubresourcesGVR = schema.GroupVersionResource{
+		Group:    "subresources.kubevirt.io",
+		Version:  "v1",
+		Resource: "virtualmachineinstances",
+	}
+)
+
+// CDI (Containerized Data Importer) resources
+var (
+	// DataVolumeGVR is the GroupVersionResource for DataVolume resources
+	DataVolumeGVR = schema.GroupVersionResource{
+		Group:    "cdi.kubevirt.io",
+		Version:  "v1beta1",
+		Resource: "datavolumes",
+	}
+
+	// DataSourceGVR is the GroupVersionResource for DataSource resources
+	DataSourceGVR = schema.GroupVersionResource{
+		Group:    "cdi.kubevirt.io",
+		Version:  "v1beta1",
+		Resource: "datasources",
+	}
+)
+
+// Instancetype resources
+var (
+	// VirtualMachineClusterInstancetypeGVR is the GroupVersionResource for cluster-scoped VirtualMachineClusterInstancetype resources
+	VirtualMachineClusterInstancetypeGVR = schema.GroupVersionResource{
+		Group:    "instancetype.kubevirt.io",
+		Version:  "v1beta1",
+		Resource: "virtualmachineclusterinstancetypes",
+	}
+
+	// VirtualMachineInstancetypeGVR is the GroupVersionResource for namespaced VirtualMachineInstancetype resources
+	VirtualMachineInstancetypeGVR = schema.GroupVersionResource{
+		Group:    "instancetype.kubevirt.io",
+		Version:  "v1beta1",
+		Resource: "virtualmachineinstancetypes",
+	}
+)
+
+// Preference resources
+var (
+	// VirtualMachineClusterPreferenceGVR is the GroupVersionResource for cluster-scoped VirtualMachineClusterPreference resources
+	VirtualMachineClusterPreferenceGVR = schema.GroupVersionResource{
+		Group:    "instancetype.kubevirt.io",
+		Version:  "v1beta1",
+		Resource: "virtualmachineclusterpreferences",
+	}
+
+	// VirtualMachinePreferenceGVR is the GroupVersionResource for namespaced VirtualMachinePreference resources
+	VirtualMachinePreferenceGVR = schema.GroupVersionResource{
+		Group:    "instancetype.kubevirt.io",
+		Version:  "v1beta1",
+		Resource: "virtualmachinepreferences",
+	}
+)
+
+// Clone resources
+var (
+	// VirtualMachineCloneGVR is the GroupVersionResource for VirtualMachineClone resources
+	VirtualMachineCloneGVR = schema.GroupVersionResource{
+		Group:    "clone.kubevirt.io",
+		Version:  "v1beta1",
+		Resource: "virtualmachineclones",
+	}
+)
+
+// Migration resources
+var (
+	// VirtualMachineInstanceMigrationGVR is the GroupVersionResource for VirtualMachineInstanceMigration resources
+	VirtualMachineInstanceMigrationGVR = schema.GroupVersionResource{
+		Group:    "kubevirt.io",
+		Version:  "v1",
+		Resource: "virtualmachineinstancemigrations",
+	}
+)
+
+// HasVirtualMachine returns a TargetCompatibilityFilter that checks whether any
+// target cluster has the VirtualMachine GVK registered.
+func HasVirtualMachine(p api.FilteringProvider) func() bool {
+	return func() bool {
+		return p.AnyTargetHasGVKs(context.TODO(), []schema.GroupVersionKind{VirtualMachineGVK})
+	}
+}
+
+// Kubernetes core resources
+var (
+	// PersistentVolumeClaimGVR is the GroupVersionResource for PersistentVolumeClaim resources
+	PersistentVolumeClaimGVR = schema.GroupVersionResource{
+		Group:    "",
+		Version:  "v1",
+		Resource: "persistentvolumeclaims",
+	}
+
+	// PodGVR is the GroupVersionResource for Pod resources
+	PodGVR = schema.GroupVersionResource{
+		Group:    "",
+		Version:  "v1",
+		Resource: "pods",
+	}
+
+	// StorageClassGVR is the GroupVersionResource for StorageClass resources
+	StorageClassGVR = schema.GroupVersionResource{
+		Group:    "storage.k8s.io",
+		Version:  "v1",
+		Resource: "storageclasses",
+	}
+)

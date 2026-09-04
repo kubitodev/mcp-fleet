@@ -1,0 +1,389 @@
+package http
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"flag"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"regexp"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/go-logr/logr"
+
+	"github.com/containers/kubernetes-mcp-server/internal/test"
+	"github.com/containers/kubernetes-mcp-server/pkg/api"
+	"github.com/containers/kubernetes-mcp-server/pkg/config"
+	"github.com/containers/kubernetes-mcp-server/pkg/kubernetes"
+	"github.com/containers/kubernetes-mcp-server/pkg/mcp"
+	"github.com/containers/kubernetes-mcp-server/pkg/oauth"
+	"github.com/coreos/go-oidc/v3/oidc"
+	"github.com/coreos/go-oidc/v3/oidc/oidctest"
+	"github.com/stretchr/testify/suite"
+	"golang.org/x/sync/errgroup"
+	"k8s.io/klog/v2"
+	"k8s.io/klog/v2/textlogger"
+)
+
+type BaseHttpSuite struct {
+	suite.Suite
+	MockServer      *test.MockServer
+	StaticConfig    *config.StaticConfig
+	Logger          logr.Logger
+	mcpServer       *mcp.Server
+	OidcProvider    *oidc.Provider
+	OAuthState      *oauth.State
+	timeoutCancel   context.CancelFunc
+	StopServer      context.CancelFunc
+	WaitForShutdown func() error
+}
+
+func (s *BaseHttpSuite) SetupTest() {
+	http.DefaultClient.Timeout = 10 * time.Second
+	s.MockServer = test.NewMockServer()
+	s.MockServer.Handle(test.NewDiscoveryClientHandler())
+	s.StaticConfig = config.Default()
+	s.StaticConfig.KubeConfig = s.MockServer.KubeconfigFile(s.T())
+}
+
+func (s *BaseHttpSuite) StartServer() {
+	// Stop any previously started server so multiple StartServer calls in the same test do not leak resources.
+	s.stopRunningServer()
+
+	tcpAddr, err := test.RandomPortAddress()
+	s.Require().NoError(err, "Expected no error getting random port address")
+	s.StaticConfig.Port = strconv.Itoa(tcpAddr.Port)
+
+	s.OAuthState = oauth.NewState(oauth.SnapshotFromConfig(s.StaticConfig, s.OidcProvider, nil))
+	provider, err := kubernetes.NewProvider(s.T().Context(), s.StaticConfig, kubernetes.WithTokenExchange(s.OAuthState))
+	s.Require().NoError(err, "Expected no error creating kubernetes target provider")
+	s.mcpServer, err = mcp.NewServer(s.T().Context(), mcp.Configuration{StaticConfig: s.StaticConfig}, provider)
+	s.Require().NoError(err, "Expected no error creating MCP server")
+	s.Require().NotNil(s.mcpServer, "MCP server should not be nil")
+	var timeoutCtx, cancelCtx context.Context
+	timeoutCtx, s.timeoutCancel = context.WithTimeout(s.T().Context(), 10*time.Second)
+	group, gc := errgroup.WithContext(timeoutCtx)
+	cancelCtx, s.StopServer = context.WithCancel(gc)
+	if s.Logger.GetSink() != nil {
+		cancelCtx = klog.NewContext(cancelCtx, s.Logger)
+	}
+	group.Go(func() error {
+		return Serve(cancelCtx, s.mcpServer, config.NewStaticConfigState(s.StaticConfig), s.OAuthState)
+	})
+	s.WaitForShutdown = group.Wait
+	s.Require().NoError(test.WaitForServer(tcpAddr), "HTTP server did not start in time")
+	s.Require().NoError(test.WaitForHealthz(tcpAddr), "HTTP server /healthz endpoint did not respond with non-404 in time")
+}
+
+func (s *BaseHttpSuite) TearDownTest() {
+	s.MockServer.Close()
+	s.stopRunningServer()
+}
+
+// stopRunningServer cancels the running HTTP server, waits for the Serve goroutine to return,
+// and releases the associated resources. Safe to call when no server has been started yet
+// and idempotent across repeated invocations. StartServer assigns mcpServer, timeoutCancel,
+// StopServer and WaitForShutdown as a group, so checking StopServer alone is sufficient.
+func (s *BaseHttpSuite) stopRunningServer() {
+	if s.StopServer == nil {
+		return
+	}
+	s.StopServer()
+	s.Require().NoError(s.WaitForShutdown(), "HTTP server did not shut down gracefully")
+	s.mcpServer.Close()
+	s.timeoutCancel()
+	s.StopServer = nil
+	s.WaitForShutdown = nil
+	s.mcpServer = nil
+	s.timeoutCancel = nil
+}
+
+type httpContext struct {
+	klogState       klog.State
+	logger          logr.Logger
+	mockServer      *test.MockServer
+	LogBuffer       test.SyncBuffer
+	HttpAddress     string             // HTTP server address
+	timeoutCancel   context.CancelFunc // Release resources if test completes before the timeout
+	StopServer      context.CancelFunc
+	WaitForShutdown func() error
+	StaticConfig    *config.StaticConfig
+	OidcProvider    *oidc.Provider
+	OAuthState      *oauth.State
+}
+
+func (c *httpContext) beforeEach(t *testing.T) {
+	t.Helper()
+	http.DefaultClient.Timeout = 10 * time.Second
+	if c.StaticConfig == nil {
+		c.StaticConfig = config.Default()
+	}
+	c.mockServer = test.NewMockServer()
+	// Fake Kubernetes configuration
+	c.StaticConfig.KubeConfig = c.mockServer.KubeconfigFile(t)
+	// Capture logging
+	c.klogState = klog.CaptureState()
+	flags := flag.NewFlagSet("test", flag.ContinueOnError)
+	klog.InitFlags(flags)
+	_ = flags.Set("v", "5")
+	c.logger = textlogger.NewLogger(textlogger.NewConfig(textlogger.Verbosity(5), textlogger.Output(&c.LogBuffer)))
+	// Start server in random port
+	ln, err := net.Listen("tcp", "0.0.0.0:0")
+	if err != nil {
+		t.Fatalf("Failed to find random port for HTTP server: %v", err)
+	}
+	c.HttpAddress = ln.Addr().String()
+	if randomPortErr := ln.Close(); randomPortErr != nil {
+		t.Fatalf("Failed to close random port listener: %v", randomPortErr)
+	}
+	c.StaticConfig.Port = fmt.Sprintf("%d", ln.Addr().(*net.TCPAddr).Port)
+	c.OAuthState = oauth.NewState(oauth.SnapshotFromConfig(c.StaticConfig, c.OidcProvider, nil))
+	provider, err := kubernetes.NewProvider(t.Context(), c.StaticConfig, kubernetes.WithTokenExchange(c.OAuthState))
+	if err != nil {
+		t.Fatalf("Failed to create kubernetes target provider: %v", err)
+	}
+	mcpServer, err := mcp.NewServer(t.Context(), mcp.Configuration{StaticConfig: c.StaticConfig}, provider)
+	if err != nil {
+		t.Fatalf("Failed to create MCP server: %v", err)
+	}
+	var timeoutCtx, cancelCtx context.Context
+	timeoutCtx, c.timeoutCancel = context.WithTimeout(t.Context(), 10*time.Second)
+	group, gc := errgroup.WithContext(timeoutCtx)
+	cancelCtx, c.StopServer = context.WithCancel(gc)
+	group.Go(func() error {
+		return Serve(klog.NewContext(cancelCtx, c.logger), mcpServer, config.NewStaticConfigState(c.StaticConfig), c.OAuthState)
+	})
+	c.WaitForShutdown = group.Wait
+	// Wait for HTTP server to start (using net)
+	for i := 0; i < 10; i++ {
+		conn, err := net.Dial("tcp", c.HttpAddress)
+		if err == nil {
+			_ = conn.Close()
+			break
+		}
+		time.Sleep(50 * time.Millisecond) // Wait before retrying
+	}
+}
+
+func (c *httpContext) afterEach(t *testing.T) {
+	t.Helper()
+	c.mockServer.Close()
+	c.StopServer()
+	err := c.WaitForShutdown()
+	if err != nil {
+		t.Errorf("HTTP server did not shut down gracefully: %v", err)
+	}
+	c.timeoutCancel()
+	c.klogState.Restore()
+	_ = os.Setenv("KUBECONFIG", "")
+}
+
+func testCase(t *testing.T, test func(c *httpContext)) {
+	testCaseWithContext(t, &httpContext{}, test)
+}
+
+func testCaseWithContext(t *testing.T, httpCtx *httpContext, test func(c *httpContext)) {
+	httpCtx.beforeEach(t)
+	defer httpCtx.afterEach(t)
+	test(httpCtx)
+}
+
+type OidcTestServer struct {
+	*rsa.PrivateKey
+	*oidc.Provider
+	*httptest.Server
+	TokenEndpointHandler http.HandlerFunc
+}
+
+func NewOidcTestServer(t *testing.T) (oidcTestServer *OidcTestServer) {
+	t.Helper()
+	var err error
+	oidcTestServer = &OidcTestServer{}
+	oidcTestServer.PrivateKey, err = rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("failed to generate private key for oidc: %v", err)
+	}
+	oidcServer := &oidctest.Server{
+		Algorithms: []string{oidc.RS256, oidc.ES256},
+		PublicKeys: []oidctest.PublicKey{
+			{
+				PublicKey: oidcTestServer.Public(),
+				KeyID:     "test-oidc-key-id",
+				Algorithm: oidc.RS256,
+			},
+		},
+	}
+	oidcTestServer.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" && oidcTestServer.TokenEndpointHandler != nil {
+			oidcTestServer.TokenEndpointHandler.ServeHTTP(w, r)
+			return
+		}
+		oidcServer.ServeHTTP(w, r)
+	}))
+	oidcServer.SetIssuer(oidcTestServer.URL)
+	oidcTestServer.Provider, err = oidc.NewProvider(t.Context(), oidcTestServer.URL)
+	if err != nil {
+		t.Fatalf("failed to create OIDC provider: %v", err)
+	}
+	return
+}
+
+func TestGracefulShutdown(t *testing.T) {
+	testCase(t, func(ctx *httpContext) {
+		ctx.StopServer()
+		err := ctx.WaitForShutdown()
+		t.Run("Stops gracefully", func(t *testing.T) {
+			if err != nil {
+				t.Errorf("Expected graceful shutdown, but got error: %v", err)
+			}
+		})
+		t.Run("Stops on context cancel", func(t *testing.T) {
+			if !strings.Contains(ctx.LogBuffer.String(), "Context cancelled, initiating graceful shutdown") {
+				t.Errorf("Context cancelled, initiating graceful shutdown, got: %s", ctx.LogBuffer.String())
+			}
+		})
+		t.Run("Starts server shutdown", func(t *testing.T) {
+			if !strings.Contains(ctx.LogBuffer.String(), "Shutting down HTTP server gracefully") {
+				t.Errorf("Expected graceful shutdown log, got: %s", ctx.LogBuffer.String())
+			}
+		})
+		t.Run("Server shutdown completes", func(t *testing.T) {
+			if !strings.Contains(ctx.LogBuffer.String(), "HTTP server shutdown complete") {
+				t.Errorf("Expected HTTP server shutdown completed log, got: %s", ctx.LogBuffer.String())
+			}
+		})
+	})
+}
+
+func TestHealthCheck(t *testing.T) {
+	testCase(t, func(ctx *httpContext) {
+		t.Run("Exposes health check endpoint at /healthz", func(t *testing.T) {
+			resp, err := http.Get(fmt.Sprintf("http://%s/healthz", ctx.HttpAddress))
+			if err != nil {
+				t.Fatalf("Failed to get health check endpoint: %v", err)
+			}
+			t.Cleanup(func() { _ = resp.Body.Close() })
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("Expected HTTP 200 OK, got %d", resp.StatusCode)
+			}
+		})
+	})
+	// Health exposed even when require Authorization
+	testCaseWithContext(t, &httpContext{StaticConfig: &config.StaticConfig{RequireOAuth: true, ClusterProviderStrategy: api.ClusterProviderKubeConfig}}, func(ctx *httpContext) {
+		resp, err := http.Get(fmt.Sprintf("http://%s/healthz", ctx.HttpAddress))
+		if err != nil {
+			t.Fatalf("Failed to get health check endpoint with OAuth: %v", err)
+		}
+		t.Cleanup(func() { _ = resp.Body.Close() })
+		t.Run("Health check with OAuth returns HTTP 200 OK", func(t *testing.T) {
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("Expected HTTP 200 OK, got %d", resp.StatusCode)
+			}
+		})
+	})
+}
+
+func TestBindAddress(t *testing.T) {
+	t.Run("binds to specified address", func(t *testing.T) {
+		testCaseWithContext(t, &httpContext{StaticConfig: &config.StaticConfig{BindAddress: "127.0.0.1"}}, func(ctx *httpContext) {
+			loopbackAddr := net.JoinHostPort("127.0.0.1", ctx.StaticConfig.Port)
+			resp, err := http.Get(fmt.Sprintf("http://%s/healthz", loopbackAddr))
+			if err != nil {
+				t.Fatalf("Failed to reach server on bound address: %v", err)
+			}
+			t.Cleanup(func() { _ = resp.Body.Close() })
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("Expected HTTP 200 OK, got %d", resp.StatusCode)
+			}
+		})
+	})
+	t.Run("warns when on 0.0.0.0 without TLS or OAuth", func(t *testing.T) {
+		testCaseWithContext(t, &httpContext{StaticConfig: &config.StaticConfig{BindAddress: "0.0.0.0"}}, func(ctx *httpContext) {
+			ctx.StopServer()
+			_ = ctx.WaitForShutdown()
+			logStr := ctx.LogBuffer.String()
+			if !strings.Contains(logStr, "HTTP server is listening on all interfaces without TLS or authentication") {
+				t.Errorf("Expected warning about listening on all interfaces, got: %s", logStr)
+			}
+		})
+	})
+	t.Run("warns when on :: without TLS or OAuth", func(t *testing.T) {
+		testCaseWithContext(t, &httpContext{StaticConfig: &config.StaticConfig{BindAddress: "::"}}, func(ctx *httpContext) {
+			ctx.StopServer()
+			_ = ctx.WaitForShutdown()
+			logStr := ctx.LogBuffer.String()
+			if !strings.Contains(logStr, "HTTP server is listening on all interfaces without TLS or authentication") {
+				t.Errorf("Expected warning about listening on all interfaces, got: %s", logStr)
+			}
+		})
+	})
+	t.Run("no warning when on 127.0.0.1", func(t *testing.T) {
+		testCaseWithContext(t, &httpContext{StaticConfig: &config.StaticConfig{BindAddress: "127.0.0.1"}}, func(ctx *httpContext) {
+			ctx.StopServer()
+			_ = ctx.WaitForShutdown()
+			logStr := ctx.LogBuffer.String()
+			if strings.Contains(logStr, "HTTP server is listening on all interfaces without TLS or authentication") {
+				t.Errorf("Expected no warning about listening on all interfaces for 127.0.0.1, got: %s", logStr)
+			}
+		})
+	})
+	t.Run("no warning when TLS is configured", func(t *testing.T) {
+		testCaseWithContext(t, &httpContext{StaticConfig: &config.StaticConfig{BindAddress: "0.0.0.0", TLSCert: "/dummy-cert.pem"}}, func(ctx *httpContext) {
+			ctx.StopServer()
+			_ = ctx.WaitForShutdown()
+			logStr := ctx.LogBuffer.String()
+			if strings.Contains(logStr, "HTTP server is listening on all interfaces without TLS or authentication") {
+				t.Errorf("Expected no warning when TLS cert is configured, got: %s", logStr)
+			}
+		})
+	})
+	t.Run("no warning when OAuth is enabled", func(t *testing.T) {
+		testCaseWithContext(t, &httpContext{StaticConfig: &config.StaticConfig{BindAddress: "0.0.0.0", RequireOAuth: true, ClusterProviderStrategy: api.ClusterProviderKubeConfig}}, func(ctx *httpContext) {
+			ctx.StopServer()
+			_ = ctx.WaitForShutdown()
+			logStr := ctx.LogBuffer.String()
+			if strings.Contains(logStr, "HTTP server is listening on all interfaces without TLS or authentication") {
+				t.Errorf("Expected no warning when OAuth is enabled, got: %s", logStr)
+			}
+		})
+	})
+}
+
+func TestMiddlewareLogging(t *testing.T) {
+	testCase(t, func(ctx *httpContext) {
+		_, _ = http.Get(fmt.Sprintf("http://%s/.well-known/oauth-protected-resource", ctx.HttpAddress))
+		t.Run("Logs HTTP requests and responses", func(t *testing.T) {
+			logStr := ctx.LogBuffer.String()
+			if !strings.Contains(logStr, "HTTP request completed") {
+				t.Errorf("Expected log entry for HTTP request completed, got: %s", logStr)
+			}
+			if !strings.Contains(logStr, `url.path="/.well-known/oauth-protected-resource"`) {
+				t.Errorf("Expected log to contain url.path, got: %s", logStr)
+			}
+			if !strings.Contains(logStr, "http.response.status_code=404") {
+				t.Errorf("Expected log to contain status code 404, got: %s", logStr)
+			}
+		})
+		t.Run("Logs HTTP request duration", func(t *testing.T) {
+			expected := `duration="(.+?)"`
+			m := regexp.MustCompile(expected).FindStringSubmatch(ctx.LogBuffer.String())
+			if len(m) != 2 {
+				t.Fatalf("Expected log entry to contain duration, got %s", ctx.LogBuffer.String())
+			}
+			duration, err := time.ParseDuration(m[1])
+			if err != nil {
+				t.Fatalf("Failed to parse duration from log entry: %v", err)
+			}
+			if duration < 0 {
+				t.Errorf("Expected duration to be non-negative, got %v", duration)
+			}
+		})
+	})
+}

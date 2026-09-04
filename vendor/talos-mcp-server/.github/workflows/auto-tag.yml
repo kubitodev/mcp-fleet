@@ -1,0 +1,48 @@
+name: auto-tag
+
+on:
+  push:
+    branches: [main]
+    # Only tag when server code or release-relevant metadata changes. npm/ is excluded
+    # intentionally: npm wrapper changes cannot alter the compiled binary and should not
+    # trigger a release without Go CI validation. server.json IS included because the
+    # mcp-registry-publish job (in release.yml) consumes it — a description / metadata
+    # fix needs a patch release to reach the registry. NOTE: keep this path list in sync
+    # with ci.yml 'changes' job for Go-relevant entries; server.json is intentionally
+    # outside the Go filter (server.json-only PRs skip Go lint/test, which is correct).
+    paths:
+      - '*.go'
+      - 'cmd/**'
+      - 'internal/**'
+      - 'go.mod'
+      - 'go.sum'
+      - 'Makefile'
+      - '.goreleaser.yaml'
+      - 'server.json'
+
+permissions:
+  contents: read
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        id: app-token
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v4
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - uses: mathieudutour/github-tag-action@a22cf08638b34d5badda920f9daf6e72c477b07b # v6.2
+        with:
+          github_token: ${{ steps.app-token.outputs.token }}
+          default_bump: false
+          tag_prefix: "v"
+          fetch_all_tags: true

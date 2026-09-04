@@ -1,0 +1,19 @@
+version: 2
+updates:
+  # Keep GitHub Actions (incl. the Docker publish workflow) patched.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+
+  # Keep the Dockerfile base images patched.
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+
+  # Keep Go module dependencies patched.
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly

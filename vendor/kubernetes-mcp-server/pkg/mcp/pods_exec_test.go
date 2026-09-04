@@ -1,0 +1,226 @@
+package mcp
+
+import (
+	"bytes"
+	"io"
+	"net/http"
+	"strings"
+	"testing"
+
+	"github.com/BurntSushi/toml"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/stretchr/testify/suite"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/containers/kubernetes-mcp-server/internal/test"
+)
+
+type PodsExecSuite struct {
+	BaseMcpSuite
+	mockServer *test.MockServer
+}
+
+func (s *PodsExecSuite) SetupTest() {
+	s.BaseMcpSuite.SetupTest()
+	s.mockServer = test.NewMockServer()
+	s.mockServer.Handle(test.NewDiscoveryClientHandler())
+	s.Cfg.KubeConfig = s.mockServer.KubeconfigFile(s.T())
+}
+
+func (s *PodsExecSuite) TearDownTest() {
+	s.BaseMcpSuite.TearDownTest()
+	if s.mockServer != nil {
+		s.mockServer.Close()
+	}
+}
+
+func (s *PodsExecSuite) TestPodsExec() {
+	s.mockServer.Handle(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/api/v1/namespaces/default/pods/pod-to-exec/exec" {
+			return
+		}
+		var stdin, stdout bytes.Buffer
+		ctx, err := test.CreateHTTPStreams(w, req, &test.StreamOptions{
+			Stdin:  &stdin,
+			Stdout: &stdout,
+		})
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(err.Error()))
+			return
+		}
+		defer func() { _ = ctx.Close() }()
+		_, _ = io.WriteString(ctx.StdoutStream, "command:"+strings.Join(req.URL.Query()["command"], " ")+"\n")
+		_, _ = io.WriteString(ctx.StdoutStream, "container:"+strings.Join(req.URL.Query()["container"], " ")+"\n")
+	}))
+	s.mockServer.Handle(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/api/v1/namespaces/default/pods/pod-to-exec" {
+			return
+		}
+		test.WriteObject(w, &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "default",
+				Name:      "pod-to-exec",
+			},
+			Spec: v1.PodSpec{Containers: []v1.Container{{Name: "container-to-exec"}}},
+		})
+	}))
+	s.InitMcpClient()
+
+	s.Run("pods_exec(name=pod-to-exec, namespace=nil, command=[ls -l]), uses configured namespace", func() {
+		result, err := s.CallTool("pods_exec", map[string]interface{}{
+			"name":    "pod-to-exec",
+			"command": []interface{}{"ls", "-l"},
+		})
+		s.Require().NotNil(result)
+		s.Run("returns command output", func() {
+			s.NoError(err, "call tool failed %v", err)
+			s.Falsef(result.IsError, "call tool failed: %v", result.Content)
+			s.Contains(result.Content[0].(*mcp.TextContent).Text, "command:ls -l\n", "unexpected result %v", result.Content[0].(*mcp.TextContent).Text)
+		})
+	})
+	s.Run("pods_exec(name=pod-to-exec, namespace=default, command=[ls -l])", func() {
+		result, err := s.CallTool("pods_exec", map[string]interface{}{
+			"namespace": "default",
+			"name":      "pod-to-exec",
+			"command":   []interface{}{"ls", "-l"},
+		})
+		s.Require().NotNil(result)
+		s.Run("returns command output", func() {
+			s.NoError(err, "call tool failed %v", err)
+			s.Falsef(result.IsError, "call tool failed: %v", result.Content)
+			s.Contains(result.Content[0].(*mcp.TextContent).Text, "command:ls -l\n", "unexpected result %v", result.Content[0].(*mcp.TextContent).Text)
+		})
+	})
+	s.Run("pods_exec(name=pod-to-exec, namespace=default, command=[ls -l], container=a-specific-container)", func() {
+		result, err := s.CallTool("pods_exec", map[string]interface{}{
+			"namespace": "default",
+			"name":      "pod-to-exec",
+			"command":   []interface{}{"ls", "-l"},
+			"container": "a-specific-container",
+		})
+		s.Require().NotNil(result)
+		s.Run("returns command output", func() {
+			s.NoError(err, "call tool failed %v", err)
+			s.Falsef(result.IsError, "call tool failed: %v", result.Content)
+			s.Contains(result.Content[0].(*mcp.TextContent).Text, "command:ls -l\n", "unexpected result %v", result.Content[0].(*mcp.TextContent).Text)
+		})
+	})
+}
+
+func (s *PodsExecSuite) TestPodsExecDefaultContainer() {
+	s.mockServer.Handle(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if !strings.HasSuffix(req.URL.Path, "/exec") {
+			return
+		}
+		var stdin, stdout bytes.Buffer
+		ctx, err := test.CreateHTTPStreams(w, req, &test.StreamOptions{
+			Stdin:  &stdin,
+			Stdout: &stdout,
+		})
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(err.Error()))
+			return
+		}
+		defer func() { _ = ctx.Close() }()
+		_, _ = io.WriteString(ctx.StdoutStream, "container:"+strings.Join(req.URL.Query()["container"], " ")+"\n")
+	}))
+	s.mockServer.Handle(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch req.URL.Path {
+		case "/api/v1/namespaces/default/pods/multi-with-annotation":
+			test.WriteObject(w, &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "multi-with-annotation",
+					Annotations: map[string]string{
+						"kubectl.kubernetes.io/default-container": "sidecar",
+					},
+				},
+				Spec: v1.PodSpec{Containers: []v1.Container{
+					{Name: "main"},
+					{Name: "sidecar"},
+				}},
+			})
+		case "/api/v1/namespaces/default/pods/multi-no-annotation":
+			test.WriteObject(w, &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "multi-no-annotation",
+				},
+				Spec: v1.PodSpec{Containers: []v1.Container{
+					{Name: "first"},
+					{Name: "second"},
+				}},
+			})
+		}
+	}))
+	s.InitMcpClient()
+
+	s.Run("multi-container pod with annotation uses annotated container", func() {
+		result, err := s.CallTool("pods_exec", map[string]interface{}{
+			"name":    "multi-with-annotation",
+			"command": []interface{}{"echo", "hello"},
+		})
+		s.Require().NotNil(result)
+		s.Require().NoError(err, "call tool failed %v", err)
+		s.Falsef(result.IsError, "call tool failed: %v", result.Content)
+		s.Contains(result.Content[0].(*mcp.TextContent).Text, "container:sidecar",
+			"expected annotation container 'sidecar', got %v", result.Content[0].(*mcp.TextContent).Text)
+	})
+	s.Run("multi-container pod without annotation falls back to first container", func() {
+		result, err := s.CallTool("pods_exec", map[string]interface{}{
+			"name":    "multi-no-annotation",
+			"command": []interface{}{"echo", "hello"},
+		})
+		s.Require().NotNil(result)
+		s.Require().NoError(err, "call tool failed %v", err)
+		s.Falsef(result.IsError, "call tool failed: %v", result.Content)
+		s.Contains(result.Content[0].(*mcp.TextContent).Text, "container:first",
+			"expected first container 'first', got %v", result.Content[0].(*mcp.TextContent).Text)
+	})
+	s.Run("explicit container takes precedence over annotation", func() {
+		result, err := s.CallTool("pods_exec", map[string]interface{}{
+			"name":      "multi-with-annotation",
+			"command":   []interface{}{"echo", "hello"},
+			"container": "main",
+		})
+		s.Require().NotNil(result)
+		s.Require().NoError(err, "call tool failed %v", err)
+		s.Falsef(result.IsError, "call tool failed: %v", result.Content)
+		s.Contains(result.Content[0].(*mcp.TextContent).Text, "container:main",
+			"expected explicit container 'main', got %v", result.Content[0].(*mcp.TextContent).Text)
+	})
+}
+
+func (s *PodsExecSuite) TestPodsExecDenied() {
+	s.Require().NoError(toml.Unmarshal([]byte(`
+		denied_resources = [ { version = "v1", kind = "Pod" } ]
+	`), s.Cfg), "Expected to parse denied resources config")
+	s.InitMcpClient()
+	s.Run("pods_exec (denied)", func() {
+		toolResult, err := s.CallTool("pods_exec", map[string]interface{}{
+			"namespace": "default",
+			"name":      "pod-to-exec",
+			"command":   []interface{}{"ls", "-l"},
+			"container": "a-specific-container",
+		})
+		s.Require().NotNil(toolResult, "toolResult should not be nil")
+		s.Run("has error", func() {
+			s.Truef(toolResult.IsError, "call tool should fail")
+			s.Nilf(err, "call tool should not return error object")
+		})
+		s.Run("describes denial", func() {
+			msg := toolResult.Content[0].(*mcp.TextContent).Text
+			s.Contains(msg, "resource not allowed:")
+			expectedMessage := "failed to exec in pod pod-to-exec in namespace default:(.+:)? resource not allowed: /v1, Kind=Pod"
+			s.Regexpf(expectedMessage, msg,
+				"expected descriptive error '%s', got %v", expectedMessage, msg)
+		})
+	})
+}
+
+func TestPodsExec(t *testing.T) {
+	suite.Run(t, new(PodsExecSuite))
+}

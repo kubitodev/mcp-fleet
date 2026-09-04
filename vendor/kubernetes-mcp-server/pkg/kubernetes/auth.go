@@ -1,0 +1,65 @@
+package kubernetes
+
+import (
+	"context"
+
+	authv1 "k8s.io/api/authorization/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	authv1client "k8s.io/client-go/kubernetes/typed/authorization/v1"
+
+	"github.com/containers/kubernetes-mcp-server/pkg/klogutil"
+)
+
+// CanI checks if the current identity can perform verb on resource.
+// Uses SelfSubjectAccessReview to pre-check RBAC permissions.
+func CanI(
+	ctx context.Context,
+	authClient authv1client.AuthorizationV1Interface,
+	gvr *schema.GroupVersionResource,
+	namespace, resourceName, verb string,
+) (bool, error) {
+	if authClient == nil {
+		return true, nil
+	}
+
+	accessReview := &authv1.SelfSubjectAccessReview{
+		Spec: authv1.SelfSubjectAccessReviewSpec{
+			ResourceAttributes: &authv1.ResourceAttributes{
+				Namespace: namespace,
+				Verb:      verb,
+				Group:     gvr.Group,
+				Version:   gvr.Version,
+				Resource:  gvr.Resource,
+				Name:      resourceName,
+			},
+		},
+	}
+
+	response, err := authClient.SelfSubjectAccessReviews().Create(ctx, accessReview, metav1.CreateOptions{})
+	if err != nil {
+		return false, err
+	}
+
+	logger := klogutil.FromContext(ctx)
+	if logger.V(5).Enabled() {
+		if response.Status.Allowed {
+			logger.V(5).Info("RBAC check allowed",
+				"kubernetes.rbac.verb", verb,
+				"kubernetes.api.group", gvr.Group,
+				"kubernetes.api.resource", gvr.Resource,
+				"kubernetes.namespace.name", namespace,
+			)
+		} else {
+			logger.V(5).Info("RBAC check denied",
+				"kubernetes.rbac.verb", verb,
+				"kubernetes.api.group", gvr.Group,
+				"kubernetes.api.resource", gvr.Resource,
+				"kubernetes.namespace.name", namespace,
+				"kubernetes.rbac.reason", response.Status.Reason,
+			)
+		}
+	}
+
+	return response.Status.Allowed, nil
+}

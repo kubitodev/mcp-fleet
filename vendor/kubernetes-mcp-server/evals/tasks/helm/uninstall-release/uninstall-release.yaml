@@ -1,0 +1,43 @@
+kind: Task
+apiVersion: mcpchecker/v1alpha2
+metadata:
+  name: "uninstall-helm-release"
+  difficulty: medium
+  labels:
+    suite: helm
+    project: helm
+    requires: helm
+  annotations:
+    project-name: "Helm"
+    project-url: "https://helm.sh"
+spec:
+  requires:
+    - extension: kubernetes
+
+  setup:
+    - kubernetes.create:
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: helm-uninstall-test
+    - kubernetes.helmInstall:
+        chart: oci://ghcr.io/cloudpirates-io/helm-charts/nginx
+        name: cleanup-test
+        namespace: helm-uninstall-test
+
+  verify:
+    - kubernetes.helmList:
+        namespace: helm-uninstall-test
+  cleanup:
+    - kubernetes.helmUninstall:
+        name: cleanup-test
+        namespace: helm-uninstall-test
+    - kubernetes.delete:
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: helm-uninstall-test
+        ignoreNotFound: true
+
+  prompt:
+    inline: Use Helm to uninstall the release named 'cleanup-test' from the 'helm-uninstall-test' namespace

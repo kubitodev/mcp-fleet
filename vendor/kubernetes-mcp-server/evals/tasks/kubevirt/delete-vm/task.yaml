@@ -1,0 +1,68 @@
+kind: Task
+apiVersion: mcpchecker/v1alpha2
+metadata:
+  labels:
+    suite: kubevirt
+    project: kubevirt
+    requires: kubevirt
+  annotations:
+    project-name: "KubeVirt"
+    project-url: "https://kubevirt.io"
+  name: "delete-vm"
+  difficulty: medium
+spec:
+  requires:
+    - extension: kubernetes
+      as: k8s
+  setup:
+    - k8s.delete:
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: vm-test-delete
+        ignoreNotFound: true
+    - k8s.create:
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: vm-test-delete
+    - k8s.create:
+        apiVersion: kubevirt.io/v1
+        kind: VirtualMachine
+        metadata:
+          name: deleted-vm
+          namespace: vm-test-delete
+        spec:
+          runStrategy: Halted
+          template:
+            spec:
+              domain:
+                devices:
+                  disks:
+                    - name: containerdisk
+                      disk:
+                        bus: virtio
+                memory:
+                  guest: 2Gi
+              terminationGracePeriodSeconds: 0
+              volumes:
+                - name: containerdisk
+                  containerDisk:
+                    image: quay.io/containerdisks/fedora:latest
+  verify:
+    # kubectl wait --for=delete is not a condition-based wait,
+    # so it must remain as a script step
+    - script:
+        inline: |-
+          #!/usr/bin/env bash
+          kubectl wait --for=delete vm/deleted-vm -n vm-test-delete --timeout 30s || exit 1
+  cleanup:
+    - k8s.delete:
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: vm-test-delete
+        ignoreNotFound: true
+  prompt:
+    inline: |
+      Please delete the virtual machine named deleted-vm in the vm-test-delete namespace.

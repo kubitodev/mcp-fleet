@@ -1,0 +1,36 @@
+# Keep the build context minimal — only Go sources are needed for `go build .`.
+
+# VCS
+.git
+.gitignore
+
+# Build / release artifacts
+dist/
+build/
+*.tar.gz
+*.zip
+*.exe
+
+# npm packaging (not used by the Docker build)
+npm/
+
+# CI, docs, and meta
+.github/
+README.md
+README.full.md
+CHANGELOG.md
+CONTRIBUTING.md
+RELEASING.md
+docker-compose.yml
+
+# Secrets / local env
+.env
+.env.*
+
+# Editor / OS / tooling
+.claude/
+CLAUDE.md
+.vscode/
+.idea/
+.DS_Store
+*.log

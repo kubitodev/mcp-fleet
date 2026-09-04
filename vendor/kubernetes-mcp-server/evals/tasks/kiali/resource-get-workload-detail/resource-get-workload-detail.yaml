@@ -1,0 +1,23 @@
+kind: Task
+apiVersion: mcpchecker/v1alpha2
+metadata:
+  labels:
+    suite: kiali
+    project: kiali
+    requires: kiali
+  annotations:
+    project-name: "Kiali"
+    project-url: "https://kiali.io"
+  name: "Inspect Workload Details"
+  category: "Resource Inspection"
+  description: "Retrieves detailed status and health information for a specific workload within the mesh."
+  difficulty: easy
+spec:
+  requires:
+  - extension: kubernetes
+    as: k8s
+  verify:
+  - llmJudge:
+      contains: "reviews-v1"
+  prompt:
+    inline: "Inspect the 'reviews-v1' workload in the 'bookinfo' namespace and provide its detailed status and health information."

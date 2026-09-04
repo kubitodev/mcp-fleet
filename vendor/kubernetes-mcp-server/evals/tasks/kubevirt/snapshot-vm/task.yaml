@@ -1,0 +1,98 @@
+kind: Task
+apiVersion: mcpchecker/v1alpha2
+metadata:
+  labels:
+    suite: kubevirt
+    project: kubevirt
+    requires: kubevirt
+  annotations:
+    project-name: "KubeVirt"
+    project-url: "https://kubevirt.io"
+  name: "snapshot-vm"
+  difficulty: medium
+spec:
+  requires:
+    - extension: kubernetes
+      as: k8s
+  setup:
+    - k8s.delete:
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: vm-test-snapshot
+        ignoreNotFound: true
+    - k8s.create:
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: vm-test-snapshot
+    - k8s.create:
+        apiVersion: kubevirt.io/v1
+        kind: VirtualMachine
+        metadata:
+          name: snapshot-test-vm
+          namespace: vm-test-snapshot
+        spec:
+          runStrategy: Halted
+          template:
+            spec:
+              domain:
+                devices:
+                  disks:
+                    - name: containerdisk
+                      disk:
+                        bus: virtio
+                memory:
+                  guest: 512Mi
+              terminationGracePeriodSeconds: 180
+              volumes:
+                - name: containerdisk
+                  containerDisk:
+                    image: quay.io/containerdisks/fedora:latest
+  verify:
+    - script:
+        inline: |-
+          #!/usr/bin/env bash
+          set -e
+          NS="vm-test-snapshot"
+          SNAPSHOT_NAME="test-snapshot"
+
+          # Verify snapshot was created
+          if ! kubectl get virtualmachinesnapshot "$SNAPSHOT_NAME" -n "$NS" &>/dev/null; then
+            echo "ERROR: VirtualMachineSnapshot '$SNAPSHOT_NAME' not found"
+            exit 1
+          fi
+
+          # Verify snapshot is for the correct VM
+          SOURCE_NAME=$(kubectl get virtualmachinesnapshot "$SNAPSHOT_NAME" -n "$NS" -o jsonpath='{.spec.source.name}')
+          if [ "$SOURCE_NAME" != "snapshot-test-vm" ]; then
+            echo "ERROR: Snapshot source is '$SOURCE_NAME', expected 'snapshot-test-vm'"
+            exit 1
+          fi
+
+          echo "All snapshot validations passed"
+          exit 0
+  cleanup:
+    - k8s.delete:
+        apiVersion: snapshot.kubevirt.io/v1beta1
+        kind: VirtualMachineSnapshot
+        metadata:
+          name: test-snapshot
+          namespace: vm-test-snapshot
+        ignoreNotFound: true
+    - k8s.delete:
+        apiVersion: kubevirt.io/v1
+        kind: VirtualMachine
+        metadata:
+          name: snapshot-test-vm
+          namespace: vm-test-snapshot
+        ignoreNotFound: true
+    - k8s.delete:
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: vm-test-snapshot
+        ignoreNotFound: true
+  prompt:
+    inline: |
+      Create a snapshot named test-snapshot of the virtual machine snapshot-test-vm in the vm-test-snapshot namespace.

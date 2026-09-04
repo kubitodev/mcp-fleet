@@ -1,0 +1,138 @@
+kind: Task
+apiVersion: mcpchecker/v1alpha2
+metadata:
+  labels:
+    suite: kubevirt
+    project: kubevirt
+    requires: kubevirt
+  annotations:
+    project-name: "KubeVirt"
+    project-url: "https://kubevirt.io"
+  name: "restore-vm"
+  difficulty: medium
+spec:
+  requires:
+    - extension: kubernetes
+      as: k8s
+  setup:
+    - k8s.delete:
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: vm-test-restore
+        ignoreNotFound: true
+    - k8s.create:
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: vm-test-restore
+    - k8s.create:
+        apiVersion: kubevirt.io/v1
+        kind: VirtualMachine
+        metadata:
+          name: restore-test-vm
+          namespace: vm-test-restore
+        spec:
+          runStrategy: Halted
+          template:
+            spec:
+              domain:
+                devices:
+                  disks:
+                    - name: containerdisk
+                      disk:
+                        bus: virtio
+                memory:
+                  guest: 512Mi
+              terminationGracePeriodSeconds: 180
+              volumes:
+                - name: containerdisk
+                  containerDisk:
+                    image: quay.io/containerdisks/fedora:latest
+    - k8s.create:
+        apiVersion: snapshot.kubevirt.io/v1beta1
+        kind: VirtualMachineSnapshot
+        metadata:
+          name: restore-snapshot
+          namespace: vm-test-restore
+        spec:
+          source:
+            apiGroup: kubevirt.io
+            kind: VirtualMachine
+            name: restore-test-vm
+    - k8s.wait:
+        apiVersion: snapshot.kubevirt.io/v1beta1
+        kind: VirtualMachineSnapshot
+        metadata:
+          name: restore-snapshot
+          namespace: vm-test-restore
+        condition: Ready
+        timeout: 30s
+  verify:
+    - script:
+        inline: |-
+          #!/usr/bin/env bash
+          set -e
+          NS="vm-test-restore"
+          RESTORE_NAME="test-restore"
+
+          # Verify restore was created
+          if ! kubectl get virtualmachinerestore "$RESTORE_NAME" -n "$NS" &>/dev/null; then
+            echo "ERROR: VirtualMachineRestore '$RESTORE_NAME' not found"
+            exit 1
+          fi
+
+          # Verify restore target VM
+          TARGET_NAME=$(kubectl get virtualmachinerestore "$RESTORE_NAME" -n "$NS" -o jsonpath='{.spec.target.name}')
+          if [ "$TARGET_NAME" != "restored-vm" ]; then
+            echo "ERROR: Restore target is '$TARGET_NAME', expected 'restored-vm'"
+            exit 1
+          fi
+
+          # Verify restore used correct snapshot
+          SNAPSHOT_NAME=$(kubectl get virtualmachinerestore "$RESTORE_NAME" -n "$NS" -o jsonpath='{.spec.virtualMachineSnapshotName}')
+          if [ "$SNAPSHOT_NAME" != "restore-snapshot" ]; then
+            echo "ERROR: Restore snapshot is '$SNAPSHOT_NAME', expected 'restore-snapshot'"
+            exit 1
+          fi
+
+          echo "All restore validations passed"
+          exit 0
+  cleanup:
+    - k8s.delete:
+        apiVersion: snapshot.kubevirt.io/v1beta1
+        kind: VirtualMachineRestore
+        metadata:
+          name: test-restore
+          namespace: vm-test-restore
+        ignoreNotFound: true
+    - k8s.delete:
+        apiVersion: snapshot.kubevirt.io/v1beta1
+        kind: VirtualMachineSnapshot
+        metadata:
+          name: restore-snapshot
+          namespace: vm-test-restore
+        ignoreNotFound: true
+    - k8s.delete:
+        apiVersion: kubevirt.io/v1
+        kind: VirtualMachine
+        metadata:
+          name: restore-test-vm
+          namespace: vm-test-restore
+        ignoreNotFound: true
+    - k8s.delete:
+        apiVersion: kubevirt.io/v1
+        kind: VirtualMachine
+        metadata:
+          name: restored-vm
+          namespace: vm-test-restore
+        ignoreNotFound: true
+    - k8s.delete:
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: vm-test-restore
+        ignoreNotFound: true
+  prompt:
+    inline: |
+      Restore the snapshot named restore-snapshot in the vm-test-restore namespace to a new virtual machine named restored-vm. Use the restore name test-restore.
