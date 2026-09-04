@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: write
+  actions: write # to dispatch build.yml (a GITHUB_TOKEN push won't trigger it on its own)
 
 concurrency:
   group: vendor-sync
@@ -29,7 +30,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: ./scripts/sync.sh
 
-      - name: Commit changes
+      - name: Commit changes and trigger build
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           if git diff --cached --quiet; then
             echo "No changes to vendor."
@@ -39,3 +42,5 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -m "chore(vendor): sync MCP sources to latest upstream releases"
           git push
+          # A GITHUB_TOKEN push does not trigger other workflows, so dispatch build explicitly.
+          gh workflow run build.yml --ref main
