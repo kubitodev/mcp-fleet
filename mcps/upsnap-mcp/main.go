@@ -4,10 +4,11 @@
 // upstream, so this is a first-party one built by kubitodev/mcp-fleet.
 //
 // Auth: PocketBase has NO static API token — you auth-with-password to get a
-// short-lived JWT. So the server logs in at startup with UPSNAP_MCP_USER /
-// UPSNAP_MCP_PASSWORD (against UPSNAP_MCP_AUTH_COLLECTION, default "users") and
-// re-auths transparently on a 401. The endpoint itself is guarded by a separate
-// bearer (UPSNAP_MCP_AUTH_TOKEN), since power tools can turn machines off.
+// short-lived JWT. So the server logs in with UPSNAP_MCP_USER / UPSNAP_MCP_PASSWORD
+// (auto-detecting the collection like UpSnap's own login: _superusers then users,
+// or pinned via UPSNAP_MCP_AUTH_COLLECTION) and re-auths transparently on a 401.
+// The endpoint itself is guarded by a separate bearer (UPSNAP_MCP_AUTH_TOKEN),
+// since power tools can turn machines off.
 package main
 
 import (
@@ -28,7 +29,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
-const version = "0.1.1"
+const version = "0.1.2"
 
 func main() {
 	base := strings.TrimRight(mustEnv("UPSNAP_URL"), "/")
@@ -233,8 +234,14 @@ func (c *Client) listRecords(ctx context.Context, collection string) ([]map[stri
 
 // power invokes an UpSnap power route (wake/shutdown/reboot/sleep and the group
 // variants). id is a device id (or group id for the *group actions).
+//
+// ?async=true: UpSnap otherwise BLOCKS the response until the action settles —
+// wake pings until the device boots (20s+), shutdown runs a remote command and
+// waits. async dispatches it in a goroutine and returns 200 immediately, which
+// is the right fit here (WoL is fire-and-forget; a long block also stalls the
+// caller's approval/callback flow). The device's status updates in UpSnap after.
 func (c *Client) power(ctx context.Context, action, id string) error {
-	body, code, err := c.request(ctx, http.MethodGet, "/api/upsnap/"+action+"/"+id)
+	body, code, err := c.request(ctx, http.MethodGet, "/api/upsnap/"+action+"/"+id+"?async=true")
 	if err != nil {
 		return err
 	}
