@@ -1,0 +1,71 @@
+# MCP supply-chain manifest.
+#
+# vendor-sync mirrors each upstream's SOURCE into vendor/<name>/ at the latest
+# release (a real archive: survives upstream deletion, auditable, patchable).
+# build.yml publishes an image to ghcr.io/kubitodev/<name> ONLY for entries with
+# build: true — the rest already ship good upstream images and are vendored purely
+# as rebuild insurance (flip build: true if their image ever disappears).
+#
+# Fields:
+#   name      image/dir name (ghcr.io/kubitodev/<name> when built)
+#   upstream  GitHub repo URL (source of truth for vendoring)
+#   ref       release tag currently vendored (auto-bumped by vendor-sync)
+#   commit    exact commit SHA of that ref (recorded by vendor-sync)
+#   build     true = we build+publish the image; false = archive-only
+#   dockerfile (build:true, optional) path to a Dockerfile if upstream ships none
+#   image     (build:false, informational) the upstream image consumers pull
+#   pin       (optional) freeze to this ref; vendor-sync won't auto-bump it
+
+mcps:
+  # ── needs an image (upstream ships none) → we build it ──
+  - name: talos-mcp-server
+    upstream: https://github.com/Nosmoht/talos-mcp-server
+    ref: v2.5.1
+    commit: ""
+    build: true
+    dockerfile: dockerfiles/talos-mcp-server.Dockerfile
+
+  # ── archive-only (upstream image is used directly) ──
+  - name: overseerr-mcp            # "seerr" MCP
+    upstream: https://github.com/jhomen368/overseerr-mcp
+    ref: v2.3.0
+    commit: ""
+    build: false
+    image: ghcr.io/jhomen368/overseerr-mcp:2.3.0
+
+  - name: jellyfin-mcp
+    upstream: https://github.com/jaredtrent/jellyfin-mcp
+    ref: v2026.604.2
+    commit: ""
+    build: false
+    image: ghcr.io/jaredtrent/jellyfin-mcp:2026.604.2
+
+  - name: immich-mcp
+    upstream: https://github.com/barryw/ImmichMCP
+    ref: v3.3.3
+    commit: ""
+    build: false
+    image: ghcr.io/barryw/immichmcp:v3.3.3
+
+  - name: mcp-for-argocd
+    upstream: https://github.com/argoproj-labs/mcp-for-argocd
+    ref: v0.9.0
+    commit: ""
+    build: false
+    image: ghcr.io/argoproj-labs/mcp-for-argocd:v0.9.0
+
+  - name: kubernetes-mcp-server
+    upstream: https://github.com/containers/kubernetes-mcp-server
+    ref: v0.0.66
+    commit: ""
+    build: false
+    image: ghcr.io/containers/kubernetes-mcp-server:v0.0.66
+
+  - name: mcp-victoriametrics
+    upstream: https://github.com/VictoriaMetrics/mcp-victoriametrics
+    ref: v1.20.2
+    commit: ""
+    build: false
+    image: ghcr.io/victoriametrics/mcp-victoriametrics:v1.20.2
+
+  # navidrome-mcp: add when needed (Blakeem/Navidrome-MCP)

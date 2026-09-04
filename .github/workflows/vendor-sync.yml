@@ -1,0 +1,41 @@
+name: vendor-sync
+
+# Mirror every MCP's source into vendor/ at its latest upstream release and record
+# ref+commit in fleet.yaml. Runs weekly + on demand. A change here pushes to main,
+# which triggers build.yml to (re)publish any build:true images.
+on:
+  schedule:
+    - cron: "17 4 * * 1" # Mondays 04:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: vendor-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install yq
+        uses: mikefarah/yq@v4
+
+      - name: Vendor sources
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/sync.sh
+
+      - name: Commit changes
+        run: |
+          if git diff --cached --quiet; then
+            echo "No changes to vendor."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore(vendor): sync MCP sources to latest upstream releases"
+          git push
