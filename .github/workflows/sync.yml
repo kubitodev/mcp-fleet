@@ -74,7 +74,7 @@ jobs:
         with:
           ref: main # pick up the source the sync job just committed
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - uses: docker/login-action@v3
         with:
