@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Vendor each MCP's source into vendor/<name>/ at the latest upstream release
-# (or its `pin`), and record ref+commit in fleet.yaml. Idempotent; stages changes.
+# Vendor each MCP's source into vendor/<name>/ — but ONLY when the resolved upstream
+# ref differs from what's already vendored (or the dir is missing). Records ref+commit
+# in fleet.yaml, and writes changed names to .changed (consumed by the build plan).
 # Requires: yq (mikefarah), gh, git, rsync.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+: > .changed
 
 count=$(yq '.mcps | length' fleet.yaml)
 for i in $(seq 0 $((count - 1))); do
@@ -22,6 +24,11 @@ for i in $(seq 0 $((count - 1))); do
   fi
   if [ -z "$tag" ]; then echo "!! $name: could not resolve a ref, skipping"; continue; fi
 
+  # skip if already at this ref and vendored — the "only if sha differs" bit
+  if [ "$tag" = "$cur" ] && [ -d "vendor/$name" ]; then
+    echo "== $name: up to date ($tag)"; continue
+  fi
+
   tmp=$(mktemp -d)
   if ! git clone --quiet --depth 1 --branch "$tag" "$upstream" "$tmp/src" 2>/dev/null; then
     echo "!! $name: clone of $tag failed, skipping"; rm -rf "$tmp"; continue
@@ -32,7 +39,8 @@ for i in $(seq 0 $((count - 1))); do
   rm -rf "$tmp"
 
   yq -i "(.mcps[$i].ref) = \"$tag\" | (.mcps[$i].commit) = \"$sha\"" fleet.yaml
-  [ "$tag" != "$cur" ] && echo ">> $name: $cur -> $tag ($sha)" || echo "== $name: $tag ($sha)"
+  echo ">> $name: $cur -> $tag ($sha)"
+  echo "$name" >> .changed
 done
 
 git add -A vendor fleet.yaml

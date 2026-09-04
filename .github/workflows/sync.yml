@@ -1,0 +1,113 @@
+name: sync
+
+# One workflow: vendor MCP sources (only when the upstream ref differs) and, in the
+# same run, build+publish images for build:true entries that CHANGED (or all, with
+# force_build). No cross-workflow trigger — the build job checks out the source the
+# sync job just committed.
+on:
+  schedule:
+    - cron: "17 4 * * 1" # Mondays 04:17 UTC
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "Rebuild all build:true images even if unchanged (bootstrap / base-image CVE)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write     # commit vendored source
+  packages: write     # push images to ghcr
+  id-token: write     # keyless provenance
+  attestations: write
+
+concurrency:
+  group: sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      any: ${{ steps.plan.outputs.any }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mikefarah/yq@v4
+
+      - name: Vendor sources (only when the ref differs)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/sync.sh
+
+      - name: Commit source changes
+        run: |
+          if git diff --cached --quiet; then echo "No source changes."; exit 0; fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore(vendor): sync MCP sources to latest upstream releases"
+          git push
+
+      - name: Plan builds (changed, or all when forced)
+        id: plan
+        run: |
+          all=$(yq -o=json -I=0 '[.mcps[] | select(.build == true) | {"name": .name, "ref": .ref, "context": ("vendor/" + .name), "dockerfile": (.dockerfile // ("vendor/" + .name + "/Dockerfile"))}]' fleet.yaml)
+          if [ "${{ inputs.force_build }}" = "true" ]; then
+            sel="$all"
+          else
+            changed=$(jq -R -s -c 'split("\n") | map(select(length > 0))' .changed 2>/dev/null || echo "[]")
+            sel=$(echo "$all" | jq -c --argjson c "$changed" '[.[] | select(.name as $n | $c | index($n))]')
+          fi
+          echo "matrix=$sel" >> "$GITHUB_OUTPUT"
+          [ "$sel" = "[]" ] && echo "any=false" >> "$GITHUB_OUTPUT" || echo "any=true" >> "$GITHUB_OUTPUT"
+          echo "Planned build set: $sel"
+
+  build:
+    needs: sync
+    if: needs.sync.outputs.any == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mcp: ${{ fromJSON(needs.sync.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main # pick up the source the sync job just committed
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.mcp.name }}
+          tags: |
+            type=raw,value=${{ matrix.mcp.ref }}
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ matrix.mcp.ref }}
+
+      - id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.mcp.context }}
+          file: ${{ matrix.mcp.dockerfile }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: true
+          sbom: true
+
+      - name: Attest provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/${{ matrix.mcp.name }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true

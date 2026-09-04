@@ -18,11 +18,15 @@ self-sufficient:
 
 ## How it works
 
-- **`vendor-sync`** (weekly + manual) resolves each MCP's latest upstream release, mirrors its
-  source into `vendor/<name>/`, records `ref` + `commit` in `fleet.yaml`, and pushes.
-- **`build`** (on `vendor/**` change, weekly, + manual) builds every `build: true` entry from
-  its vendored source and publishes `ghcr.io/<owner>/<name>:<ref>` + `:latest`, with SBOM and
-  build-provenance attestation.
+One workflow, **`sync`** (weekly + manual):
+
+1. Resolves each MCP's latest upstream release and re-vendors its source into `vendor/<name>/`
+   **only when the ref differs** (records `ref` + `commit` in `fleet.yaml`, commits, pushes).
+2. In the same run, builds every `build: true` entry **that changed** and publishes
+   `ghcr.io/<owner>/<name>:<ref>` + `:latest`, with SBOM and build-provenance attestation.
+
+Run it with **`force_build: true`** to rebuild all `build: true` images regardless of change
+(bootstrap the first image, or refresh base images after a CVE).
 
 ## Adding or changing an MCP
 
@@ -37,7 +41,7 @@ Edit `fleet.yaml`:
   # pin: v1.2.3        # optional: freeze; vendor-sync won't auto-bump
 ```
 
-Then run the `vendor-sync` workflow (or wait for the weekly run).
+Then run the `sync` workflow (or wait for the weekly run).
 
 ## Layout
 
@@ -45,9 +49,8 @@ Then run the `vendor-sync` workflow (or wait for the weekly run).
 fleet.yaml                     # the manifest (source of truth)
 vendor/<name>/                 # mirrored upstream source (committed archive)
 dockerfiles/<name>.Dockerfile  # for build:true MCPs whose upstream ships no Dockerfile
-scripts/sync.sh                # vendoring logic
-scripts/matrix.sh              # build matrix generator
-.github/workflows/             # vendor-sync.yml, build.yml, renovate.yml
+scripts/sync.sh                # vendoring logic (skips unchanged; writes .changed)
+.github/workflows/             # sync.yml (vendor + build), renovate.yml
 ```
 
 ## Notes
