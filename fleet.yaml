@@ -53,11 +53,13 @@ mcps:
     build: false
     image: ghcr.io/barryw/immichmcp:v3.3.3
   - name: paperless-mcp
-    upstream: https://github.com/barryw/PaperlessMCP
-    ref: v0.5.0
-    commit: "a3c3f14d4da8a6584a2ed7c9eab56cd36b7c5fb5"
+    upstream: https://github.com/baruchiro/paperless-mcp
+    pin: main               # no releases/tags upstream; pin the branch for archival vendoring
+    ref: main
+    commit: "031bde9ed373e0c4f79aacde39e8bc57e21f40d8"
     build: false
-    image: ghcr.io/barryw/paperlessmcp:v0.5.0
+    # upstream ships no version tags (only latest + sha-), so pin the image by digest
+    image: ghcr.io/baruchiro/paperless-mcp@sha256:abba37e831e789633900d3f6911768484b24f989793a05df83c8f95bb24ac8c5
   - name: mcp-for-argocd
     upstream: https://github.com/argoproj-labs/mcp-for-argocd
     ref: v0.9.0
