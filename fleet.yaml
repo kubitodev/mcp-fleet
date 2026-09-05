@@ -29,7 +29,7 @@ mcps:
   # ── first-party (source in-repo under mcps/, no upstream) → we build it ──
   - name: upsnap-mcp
     local: true              # source in mcps/upsnap-mcp (vendor-sync skips it)
-    ref: v0.1.2              # hand-bumped; tag when the source changes
+    ref: v0.1.3              # hand-bumped; tag when the source changes
     build: true
     context: mcps/upsnap-mcp
     dockerfile: mcps/upsnap-mcp/Dockerfile

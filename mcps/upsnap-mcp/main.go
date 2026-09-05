@@ -29,7 +29,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
-const version = "0.1.2"
+const version = "0.1.3"
 
 func main() {
 	base := strings.TrimRight(mustEnv("UPSNAP_URL"), "/")
@@ -343,6 +343,95 @@ func registerPowerTools(s *server.MCPServer, c *Client) {
 		"Wake every device in a group (Wake-on-LAN to all members).", false)
 	groupAction(s, c, "upsnap_shutdown_group", "shutdowngroup",
 		"Shut down every device in a group.", true)
+
+	registerSwitchBoot(s, c)
+}
+
+// registerSwitchBoot adds upsnap_switch_boot: reboot a machine into an alternate
+// boot target. Generic — the "boot switch" is whatever the given HELPER device's
+// shutdown command does (e.g. an SSH bootloader one-shot + reboot). The helper
+// shares the real machine's MAC/IP, so its status reflects the machine: online →
+// switch now; offline → wake it (boots the default OS first) and switch once it's
+// back up, completed in the background so the call returns immediately.
+func registerSwitchBoot(s *server.MCPServer, c *Client) {
+	s.AddTool(mcp.NewTool("upsnap_switch_boot",
+		mcp.WithDescription("Reboot a machine into an alternate boot target (e.g. the other OS of a dual-boot). Pass the UpSnap HELPER device whose shutdown command performs the boot switch. If the machine is online it switches immediately; if offline it wakes it (which boots the default OS first) and switches automatically once it is back online."),
+		mcp.WithString("device", mcp.Required(), mcp.Description("The helper device (id or name) whose shutdown command performs the boot switch")),
+		mcp.WithReadOnlyHintAnnotation(false),
+		mcp.WithDestructiveHintAnnotation(true),
+	), func(ctx context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		ident, err := r.RequireString("device")
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		dev, err := c.resolve(ctx, "devices", ident)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		id, name := str(dev["id"]), str(dev["name"])
+
+		if strings.EqualFold(str(dev["status"]), "online") {
+			if err := c.power(ctx, "shutdown", id); err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			return mcp.NewToolResultText(fmt.Sprintf("%q is online — ran its boot-switch command; the machine will reboot into the alternate OS", name)), nil
+		}
+
+		// Offline: wake the machine, then finish the switch once it's back up.
+		if err := c.power(ctx, "wake", id); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		go c.switchWhenOnline(id, name)
+		return mcp.NewToolResultText(fmt.Sprintf("%q was off — woke it (it boots the default OS first); it will switch to the alternate OS automatically once it's online (~1-2 min)", name)), nil
+	})
+}
+
+// switchWhenOnline polls until the device reports online, waits a moment for SSH
+// to come up, then triggers its boot-switch (shutdown) command. Detached from the
+// request context so it survives the tool returning; best-effort (logs outcome).
+// If the MCP pod restarts mid-wait, the pending switch is dropped — just retry.
+func (c *Client) switchWhenOnline(id, name string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("switch_boot: %q did not come online within timeout; aborting", name)
+			return
+		case <-ticker.C:
+			dev, err := c.getDevice(ctx, id)
+			if err != nil {
+				continue
+			}
+			if strings.EqualFold(str(dev["status"]), "online") {
+				time.Sleep(8 * time.Second) // ping is up; give SSH a moment
+				if err := c.power(ctx, "shutdown", id); err != nil {
+					log.Printf("switch_boot: %q online but boot-switch failed: %v", name, err)
+					return
+				}
+				log.Printf("switch_boot: %q online — boot-switch triggered", name)
+				return
+			}
+		}
+	}
+}
+
+// getDevice fetches a single device record by id.
+func (c *Client) getDevice(ctx context.Context, id string) (map[string]any, error) {
+	body, code, err := c.request(ctx, http.MethodGet, "/api/collections/devices/records/"+id)
+	if err != nil {
+		return nil, err
+	}
+	if code/100 != 2 {
+		return nil, fmt.Errorf("get device failed (%d): %s", code, strings.TrimSpace(string(body)))
+	}
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, err
+	}
+	return m, nil
 }
 
 func deviceAction(s *server.MCPServer, c *Client, name, action, desc string, destructive bool) {

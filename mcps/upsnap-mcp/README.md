@@ -16,8 +16,14 @@ Read (`readOnlyHint`):
 Power:
 - `upsnap_wake` / `upsnap_shutdown` / `upsnap_reboot` / `upsnap_sleep` — by device id or name
 - `upsnap_wake_group` / `upsnap_shutdown_group` — by group id or name
+- `upsnap_switch_boot` — reboot a machine into an alternate boot target (dual-boot).
+  Pass the UpSnap **helper** device whose shutdown command performs the boot switch
+  (e.g. an SSH bootloader one-shot + reboot); it shares the real machine's MAC/IP.
+  Online → switches now; offline → wakes it (boots the default OS first) and
+  switches automatically once it's back online (completed in the background, so
+  the call returns immediately).
 
-`shutdown`/`reboot`/`sleep` (and `shutdown_group`) carry `destructiveHint`.
+`shutdown`/`reboot`/`sleep` (and `shutdown_group`, `switch_boot`) carry `destructiveHint`.
 
 ## Config (env)
 
