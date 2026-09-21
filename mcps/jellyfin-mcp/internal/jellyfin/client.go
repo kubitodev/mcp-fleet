@@ -25,6 +25,16 @@ type JellyfinClient struct {
 func (c *JellyfinClient) BaseURL() string { return c.baseURL }
 func (c *JellyfinClient) APIKey() string  { return c.apiKey }
 
+// authHeader builds the Authorization value for an API key.
+//
+// Jellyfin 12.0 disabled the deprecated sign-in methods: the X-MediaBrowser-Token
+// and X-Emby-Token headers and the ?api_key= query parameter all return 401 now.
+// The scheme below is the only one the server still accepts, and it works on
+// 10.x as well, so there is no version branch here.
+func authHeader(apiKey string) string {
+	return fmt.Sprintf("MediaBrowser Token=%q", apiKey)
+}
+
 // NewJellyfinClient creates a client from environment variables.
 // Exits if JELLYFIN_API_KEY is not set.
 func NewJellyfinClient() *JellyfinClient {
@@ -67,7 +77,7 @@ func (c *JellyfinClient) DoRequest(ctx context.Context, method, endpoint string,
 	if err != nil {
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
-	req.Header.Set("X-MediaBrowser-Token", c.apiKey)
+	req.Header.Set("Authorization", authHeader(c.apiKey))
 	req.Header.Set("Accept", "application/json")
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -141,7 +151,7 @@ func (c *JellyfinClient) PostRaw(ctx context.Context, endpoint string, params ur
 	if err != nil {
 		return fmt.Errorf("creating request: %w", err)
 	}
-	req.Header.Set("X-MediaBrowser-Token", c.apiKey)
+	req.Header.Set("Authorization", authHeader(c.apiKey))
 	req.Header.Set("Content-Type", contentType)
 
 	resp, err := c.httpClient.Do(req)

@@ -60,6 +60,12 @@ Some MCPs don't exist upstream at all — we write them here. Put the source und
 A push touching `mcps/**` rebuilds the changed first-party image. Bump `ref` when
 you cut a new version.
 
+`mcps/` also holds **adopted** MCPs: upstreams that went dormant while we still need
+fixes. Moving one out of `vendor/` is deliberate — a patch left in `vendor/` is silently
+reverted the next time `sync.sh` re-vendors that ref. An adopted MCP keeps its upstream
+`LICENSE` and adds a `FORK.md` recording the origin commit and every local change
+(see `mcps/jellyfin-mcp/`).
+
 ## Layout
 
 ```
@@ -76,4 +82,4 @@ scripts/sync.sh                # vendoring logic (skips unchanged; writes .chang
 - `vendor-sync` pushes to `main` unreviewed. To add a checkpoint, protect `main` and switch
   the workflow to open a PR instead.
 - This repo's own glue (workflows, scripts, Dockerfiles) is MIT. Everything under `vendor/`
-  retains its upstream project's license.
+  retains its upstream project's license, as does any adopted MCP under `mcps/`.

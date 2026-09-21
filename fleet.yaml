@@ -33,6 +33,16 @@ mcps:
     build: true
     context: mcps/upsnap-mcp
     dockerfile: mcps/upsnap-mcp/Dockerfile
+  # adopted: upstream went dormant (last code commit 2026-06-05) and its auth broke
+  # on Jellyfin 12 with no fix coming, so we took ownership rather than pin a patch
+  # that vendor-sync would silently overwrite. Forked from jaredtrent/jellyfin-mcp
+  # v2026.604.2 (54af5a4), MIT — see mcps/jellyfin-mcp/FORK.md.
+  - name: jellyfin-mcp
+    local: true
+    ref: v0.1.0 # hand-bumped; tag when the source changes
+    build: true
+    context: mcps/jellyfin-mcp
+    dockerfile: mcps/jellyfin-mcp/Dockerfile
   # ── archive-only (upstream image is used directly) ──
   - name: overseerr-mcp # "seerr" MCP
     upstream: https://github.com/jhomen368/overseerr-mcp
@@ -40,12 +50,6 @@ mcps:
     commit: "aabc8647fe1a9d378b4f5ac7c5f4185bea89999b"
     build: false
     image: ghcr.io/jhomen368/overseerr-mcp:2.3.0
-  - name: jellyfin-mcp
-    upstream: https://github.com/jaredtrent/jellyfin-mcp
-    ref: v2026.604.2
-    commit: "54af5a4fe47fa2c4a0d2df23f5e7dfeaec311176"
-    build: false
-    image: ghcr.io/jaredtrent/jellyfin-mcp:2026.604.2
   - name: immich-mcp
     upstream: https://github.com/barryw/ImmichMCP
     ref: v3.3.3
