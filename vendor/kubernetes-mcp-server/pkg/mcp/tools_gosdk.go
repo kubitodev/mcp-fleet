@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 
 	"github.com/containers/kubernetes-mcp-server/pkg/api"
 	"github.com/containers/kubernetes-mcp-server/pkg/confirmation"
+	"github.com/containers/kubernetes-mcp-server/pkg/kubernetes"
 	"github.com/containers/kubernetes-mcp-server/pkg/mcplog" //nolint:staticcheck // MCP logging deprecated (SEP-2577)
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -30,11 +32,28 @@ func ServerToolToGoSdkTool(s *Server, tool api.ServerTool) (*mcp.Tool, mcp.ToolH
 	if inputSchema.Properties == nil {
 		inputSchema.Properties = make(map[string]*jsonschema.Schema)
 	}
+
+	meta := tool.Tool.Meta
+	if _, exists := meta[api.RBACMetadataKey]; exists {
+		return nil, nil, fmt.Errorf("tool %q: %q metadata must be declared through ServerTool.RBAC", tool.Tool.Name, api.RBACMetadataKey)
+	}
+
+	if tool.RBAC != nil {
+		if err := tool.RBAC.Validate(); err != nil {
+			return nil, nil, fmt.Errorf("tool %q: invalid RBAC metadata: %w", tool.Tool.Name, err)
+		}
+		meta = maps.Clone(meta)
+		if meta == nil {
+			meta = make(map[string]any)
+		}
+		meta[api.RBACMetadataKey] = tool.RBAC
+	}
+
 	goSdkTool := &mcp.Tool{
 		Name:        tool.Tool.Name,
 		Description: tool.Tool.Description,
 		Title:       tool.Tool.Annotations.Title,
-		Meta:        mcp.Meta(tool.Tool.Meta),
+		Meta:        mcp.Meta(meta),
 		Annotations: &mcp.ToolAnnotations{
 			Title:           tool.Tool.Annotations.Title,
 			ReadOnlyHint:    ptr.Deref(tool.Tool.Annotations.ReadOnlyHint, false),
@@ -79,6 +98,9 @@ func ServerToolToGoSdkTool(s *Server, tool api.ServerTool) (*mcp.Tool, mcp.ToolH
 		cluster := toolCallRequest.GetString(s.p.GetTargetParameterName(), s.p.GetDefaultTarget())
 		k, err := s.p.GetDerivedKubernetes(ctx, cluster)
 		if err != nil {
+			if errors.Is(err, kubernetes.ErrUnknownTarget) {
+				return NewTextResult("", fmt.Errorf("target %q: %w", cluster, err)), nil
+			}
 			return nil, err
 		}
 

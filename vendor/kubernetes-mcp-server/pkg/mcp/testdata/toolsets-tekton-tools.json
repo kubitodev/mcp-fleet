@@ -1,5 +1,45 @@
 [
   {
+    "_meta": {
+      "io.kubernetes-mcp-server/rbac": {
+        "bounded": {
+          "requirements": [
+            {
+              "namespace": {
+                "argument": "namespace"
+              },
+              "resourceName": {
+                "argument": "name"
+              },
+              "target": {
+                "resource": {
+                  "apiGroup": "tekton.dev",
+                  "resource": "pipelines"
+                }
+              },
+              "verbs": [
+                "get"
+              ]
+            },
+            {
+              "namespace": {
+                "argument": "namespace"
+              },
+              "target": {
+                "resource": {
+                  "apiGroup": "tekton.dev",
+                  "resource": "pipelineruns"
+                }
+              },
+              "verbs": [
+                "create"
+              ]
+            }
+          ]
+        },
+        "version": "v1alpha1"
+      }
+    },
     "annotations": {
       "destructiveHint": false,
       "idempotentHint": false,
@@ -34,6 +74,47 @@
     "title": "Tekton: Start Pipeline"
   },
   {
+    "_meta": {
+      "io.kubernetes-mcp-server/rbac": {
+        "bounded": {
+          "requirements": [
+            {
+              "namespace": {
+                "argument": "namespace"
+              },
+              "resourceName": {
+                "argument": "name"
+              },
+              "target": {
+                "resource": {
+                  "apiGroup": "tekton.dev",
+                  "resource": "pipelineruns"
+                }
+              },
+              "verbs": [
+                "get",
+                "patch"
+              ]
+            },
+            {
+              "namespace": {
+                "argument": "namespace"
+              },
+              "target": {
+                "resource": {
+                  "apiGroup": "tekton.dev",
+                  "resource": "pipelineruns"
+                }
+              },
+              "verbs": [
+                "create"
+              ]
+            }
+          ]
+        },
+        "version": "v1alpha1"
+      }
+    },
     "annotations": {
       "destructiveHint": true,
       "idempotentHint": false,
@@ -71,6 +152,60 @@
     "title": "Tekton: PipelineRun Lifecycle"
   },
   {
+    "_meta": {
+      "io.kubernetes-mcp-server/rbac": {
+        "bounded": {
+          "requirements": [
+            {
+              "namespace": {
+                "argument": "namespace"
+              },
+              "resourceName": {
+                "argument": "name"
+              },
+              "target": {
+                "resource": {
+                  "apiGroup": "tekton.dev",
+                  "resource": "pipelineruns"
+                }
+              },
+              "verbs": [
+                "get"
+              ]
+            },
+            {
+              "namespace": {
+                "argument": "namespace"
+              },
+              "target": {
+                "resource": {
+                  "apiGroup": "tekton.dev",
+                  "resource": "taskruns"
+                }
+              },
+              "verbs": [
+                "list"
+              ]
+            },
+            {
+              "namespace": {
+                "argument": "namespace"
+              },
+              "target": {
+                "resource": {
+                  "resource": "pods",
+                  "subresource": "log"
+                }
+              },
+              "verbs": [
+                "get"
+              ]
+            }
+          ]
+        },
+        "version": "v1alpha1"
+      }
+    },
     "annotations": {
       "destructiveHint": false,
       "idempotentHint": true,
@@ -89,11 +224,19 @@
           "description": "Namespace of the PipelineRun",
           "type": "string"
         },
+        "step": {
+          "description": "Step name to include within matching TaskRuns",
+          "type": "string"
+        },
         "tail": {
           "default": 100,
           "description": "Number of lines to retrieve from the end of each container log (default: 100)",
           "minimum": 0,
           "type": "integer"
+        },
+        "task": {
+          "description": "Pipeline task name to filter by (tekton.dev/pipelineTask label)",
+          "type": "string"
         }
       },
       "required": [
@@ -105,6 +248,46 @@
     "title": "Tekton: Get PipelineRun Logs"
   },
   {
+    "_meta": {
+      "io.kubernetes-mcp-server/rbac": {
+        "bounded": {
+          "requirements": [
+            {
+              "namespace": {
+                "argument": "namespace"
+              },
+              "resourceName": {
+                "argument": "name"
+              },
+              "target": {
+                "resource": {
+                  "apiGroup": "tekton.dev",
+                  "resource": "tasks"
+                }
+              },
+              "verbs": [
+                "get"
+              ]
+            },
+            {
+              "namespace": {
+                "argument": "namespace"
+              },
+              "target": {
+                "resource": {
+                  "apiGroup": "tekton.dev",
+                  "resource": "taskruns"
+                }
+              },
+              "verbs": [
+                "create"
+              ]
+            }
+          ]
+        },
+        "version": "v1alpha1"
+      }
+    },
     "annotations": {
       "destructiveHint": false,
       "idempotentHint": false,
@@ -139,6 +322,46 @@
     "title": "Tekton: Start Task"
   },
   {
+    "_meta": {
+      "io.kubernetes-mcp-server/rbac": {
+        "bounded": {
+          "requirements": [
+            {
+              "namespace": {
+                "argument": "namespace"
+              },
+              "resourceName": {
+                "argument": "name"
+              },
+              "target": {
+                "resource": {
+                  "apiGroup": "tekton.dev",
+                  "resource": "taskruns"
+                }
+              },
+              "verbs": [
+                "get"
+              ]
+            },
+            {
+              "namespace": {
+                "argument": "namespace"
+              },
+              "target": {
+                "resource": {
+                  "resource": "pods",
+                  "subresource": "log"
+                }
+              },
+              "verbs": [
+                "get"
+              ]
+            }
+          ]
+        },
+        "version": "v1alpha1"
+      }
+    },
     "annotations": {
       "destructiveHint": false,
       "idempotentHint": true,
@@ -157,6 +380,10 @@
           "description": "Namespace of the TaskRun",
           "type": "string"
         },
+        "step": {
+          "description": "Step name to include. If omitted, logs from all steps and sidecars are returned",
+          "type": "string"
+        },
         "tail": {
           "default": 100,
           "description": "Number of lines to retrieve from the end of the logs (Optional, default: 100)",
@@ -173,6 +400,46 @@
     "title": "Tekton: Get TaskRun Logs"
   },
   {
+    "_meta": {
+      "io.kubernetes-mcp-server/rbac": {
+        "bounded": {
+          "requirements": [
+            {
+              "namespace": {
+                "argument": "namespace"
+              },
+              "resourceName": {
+                "argument": "name"
+              },
+              "target": {
+                "resource": {
+                  "apiGroup": "tekton.dev",
+                  "resource": "taskruns"
+                }
+              },
+              "verbs": [
+                "get"
+              ]
+            },
+            {
+              "namespace": {
+                "argument": "namespace"
+              },
+              "target": {
+                "resource": {
+                  "apiGroup": "tekton.dev",
+                  "resource": "taskruns"
+                }
+              },
+              "verbs": [
+                "create"
+              ]
+            }
+          ]
+        },
+        "version": "v1alpha1"
+      }
+    },
     "annotations": {
       "destructiveHint": false,
       "idempotentHint": false,

@@ -8,9 +8,11 @@ import (
 	"github.com/containers/kubernetes-mcp-server/pkg/api"
 	"github.com/containers/kubernetes-mcp-server/pkg/kubernetes"
 	"github.com/google/jsonschema-go/jsonschema"
+	pipeline "github.com/tektoncd/pipeline/pkg/apis/pipeline"
 	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
@@ -39,6 +41,19 @@ func pipelineRunTools() []api.ServerTool {
 					OpenWorldHint:   ptr.To(true),
 				},
 			},
+			RBAC: api.RBACBounded(
+				api.RBACRequirement{
+					Verbs:        []string{"get", "patch"},
+					Target:       api.RBACTarget{Resource: &api.RBACResourceTarget{APIGroup: "tekton.dev", Resource: "pipelineruns"}},
+					Namespace:    &api.RBACNamespace{Argument: "namespace"},
+					ResourceName: &api.RBACResourceName{Argument: "name"},
+				},
+				api.RBACRequirement{
+					Verbs:     []string{"create"},
+					Target:    api.RBACTarget{Resource: &api.RBACResourceTarget{APIGroup: "tekton.dev", Resource: "pipelineruns"}},
+					Namespace: &api.RBACNamespace{Argument: "namespace"},
+				},
+			),
 			Handler: pipelineRunLifecycle,
 		},
 		{
@@ -55,6 +70,14 @@ func pipelineRunTools() []api.ServerTool {
 						"namespace": {
 							Type:        "string",
 							Description: "Namespace of the PipelineRun",
+						},
+						"task": {
+							Type:        "string",
+							Description: "Pipeline task name to filter by (tekton.dev/pipelineTask label)",
+						},
+						"step": {
+							Type:        "string",
+							Description: "Step name to include within matching TaskRuns",
 						},
 						"tail": {
 							Type:        "integer",
@@ -73,6 +96,24 @@ func pipelineRunTools() []api.ServerTool {
 					OpenWorldHint:   ptr.To(true),
 				},
 			},
+			RBAC: api.RBACBounded(
+				api.RBACRequirement{
+					Verbs:        []string{"get"},
+					Target:       api.RBACTarget{Resource: &api.RBACResourceTarget{APIGroup: "tekton.dev", Resource: "pipelineruns"}},
+					Namespace:    &api.RBACNamespace{Argument: "namespace"},
+					ResourceName: &api.RBACResourceName{Argument: "name"},
+				},
+				api.RBACRequirement{
+					Verbs:     []string{"list"},
+					Target:    api.RBACTarget{Resource: &api.RBACResourceTarget{APIGroup: "tekton.dev", Resource: "taskruns"}},
+					Namespace: &api.RBACNamespace{Argument: "namespace"},
+				},
+				api.RBACRequirement{
+					Verbs:     []string{"get"},
+					Target:    api.RBACTarget{Resource: &api.RBACResourceTarget{Resource: "pods", Subresource: "log"}},
+					Namespace: &api.RBACNamespace{Argument: "namespace"},
+				},
+			),
 			Handler: getPipelineRunLogs,
 		},
 	}
@@ -170,6 +211,8 @@ func getPipelineRunLogs(params api.ToolHandlerParams) (*api.ToolCallResult, erro
 	p := api.WrapParams(params)
 	name := p.RequiredString("name")
 	namespace := p.OptionalString("namespace", params.NamespaceOrDefault(""))
+	pipelineTaskName := p.OptionalString("task", "")
+	stepName := p.OptionalString("step", "")
 	tailLines := p.OptionalInt64("tail", kubernetes.DefaultTailLines)
 	if err := p.Err(); err != nil {
 		return api.NewToolCallResult("", fmt.Errorf("failed to get pipeline run logs: %w", err)), nil
@@ -179,18 +222,21 @@ func getPipelineRunLogs(params api.ToolHandlerParams) (*api.ToolCallResult, erro
 		return api.NewToolCallResult("", fmt.Errorf("failed to get PipelineRun %s/%s: %w", namespace, name, err)), nil
 	}
 
-	taskRuns, err := pipelineRunTaskRuns(params.Context, params.DynamicClient(), namespace, name)
+	taskRuns, err := pipelineRunTaskRuns(params.Context, params.DynamicClient(), namespace, name, pipelineTaskName)
 	if err != nil {
 		return api.NewToolCallResult("", fmt.Errorf("failed to list TaskRuns for PipelineRun %s/%s: %w", namespace, name, err)), nil
 	}
 	if len(taskRuns) == 0 {
+		if pipelineTaskName != "" {
+			return api.NewToolCallResult(fmt.Sprintf("No TaskRuns found for PipelineRun '%s' in namespace '%s' matching pipeline task '%s'", name, namespace, pipelineTaskName), nil), nil
+		}
 		return api.NewToolCallResult(fmt.Sprintf("No TaskRuns found for PipelineRun '%s' in namespace '%s'", name, namespace), nil), nil
 	}
 
 	var sb strings.Builder
 	for _, taskRun := range taskRuns {
 		var taskLogs strings.Builder
-		collectTaskRunLogs(params, &taskLogs, namespace, &taskRun, tailLines)
+		collectTaskRunLogs(params, &taskLogs, namespace, &taskRun, stepName, tailLines)
 		taskLogsText := taskLogs.String()
 		if strings.TrimSpace(taskLogsText) == "" {
 			continue
@@ -207,9 +253,17 @@ func getPipelineRunLogs(params api.ToolHandlerParams) (*api.ToolCallResult, erro
 	return api.NewToolCallResult(sb.String(), nil), nil
 }
 
-func pipelineRunTaskRuns(ctx context.Context, dynamicClient dynamic.Interface, namespace, pipelineRunName string) ([]tektonv1.TaskRun, error) {
+func pipelineRunTaskRuns(ctx context.Context, dynamicClient dynamic.Interface, namespace, pipelineRunName, pipelineTaskName string) ([]tektonv1.TaskRun, error) {
+	matchLabels := labels.Set{pipeline.PipelineRunLabelKey: pipelineRunName}
+	if pipelineTaskName != "" {
+		matchLabels[pipeline.PipelineTaskLabelKey] = pipelineTaskName
+	}
+	selector, err := labels.ValidatedSelectorFromSet(matchLabels)
+	if err != nil {
+		return nil, fmt.Errorf("invalid TaskRun label filter: %w", err)
+	}
 	list, err := dynamicClient.Resource(taskRunGVR).Namespace(namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: "tekton.dev/pipelineRun=" + pipelineRunName,
+		LabelSelector: selector.String(),
 	})
 	if err != nil {
 		return nil, err

@@ -16,6 +16,11 @@ updates:
       golang-x:
         patterns:
           - "golang.org/x/*"
+  - package-ecosystem: "pip"
+    directory: "/python"
+    schedule:
+      interval: "daily"
+    open-pull-requests-limit: 5
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:

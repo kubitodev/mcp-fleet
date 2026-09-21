@@ -68,8 +68,8 @@ mcps:
     image: ghcr.io/argoproj-labs/mcp-for-argocd:v0.9.0
   - name: kubernetes-mcp-server
     upstream: https://github.com/containers/kubernetes-mcp-server
-    ref: v0.0.66
-    commit: "af2fe585c2807ea3e3179ccef3d9d820565b803d"
+    ref: v0.0.67
+    commit: "fcd9bbe672c98bb81c2ce93da8c0add548023672"
     build: false
     image: ghcr.io/containers/kubernetes-mcp-server:v0.0.66
   - name: mcp-victoriametrics
