@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # ---------- build stage ----------
-FROM golang:1.26.4-alpine AS build
+FROM golang:1.27.1-alpine AS build
 
 # Never silently fetch a different toolchain than the image ships (reproducibility).
 ENV GOTOOLCHAIN=local
@@ -19,7 +19,7 @@ RUN CGO_ENABLED=0 go build -trimpath \
       -o /out/jellyfin-mcp .
 
 # ---------- runtime stage ----------
-FROM alpine:3.23
+FROM alpine:3.24
 
 # ca-certificates: required for HTTPS connections to your Jellyfin server.
 RUN apk add --no-cache ca-certificates \
