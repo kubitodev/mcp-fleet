@@ -46,8 +46,8 @@ mcps:
   # ── archive-only (upstream image is used directly) ──
   - name: overseerr-mcp # "seerr" MCP
     upstream: https://github.com/jhomen368/overseerr-mcp
-    ref: v2.3.0
-    commit: "aabc8647fe1a9d378b4f5ac7c5f4185bea89999b"
+    ref: v2.3.1
+    commit: "841a335854e377f3ee38db60843df4bbaa053b77"
     build: false
     image: ghcr.io/jhomen368/overseerr-mcp:2.3.0
   - name: immich-mcp
