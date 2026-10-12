@@ -52,8 +52,8 @@ mcps:
     image: ghcr.io/jhomen368/overseerr-mcp:2.3.0
   - name: immich-mcp
     upstream: https://github.com/barryw/ImmichMCP
-    ref: v3.3.3
-    commit: "1fb31c38724ef5f80b348c7e1b103fdcce7a9142"
+    ref: v3.3.5
+    commit: "9f5bc397ee421887bb14904d7eb2144d10c405bf"
     build: false
     image: ghcr.io/barryw/immichmcp:v3.3.3
   - name: paperless-mcp
