@@ -22,39 +22,97 @@ import (
 
 	"github.com/containers/kubernetes-mcp-server/internal/test"
 	"github.com/containers/kubernetes-mcp-server/pkg/config"
+	"github.com/containers/kubernetes-mcp-server/pkg/kubernetes"
 	"github.com/stretchr/testify/suite"
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/rest"
 )
 
 type NetObservSuite struct {
 	suite.Suite
 	MockServer *test.MockServer
-	Config     *config.StaticConfig
+	Config     *config.Config
 }
 
 func (s *NetObservSuite) SetupTest() {
 	s.MockServer = test.NewMockServer()
 	s.MockServer.Config().BearerToken = ""
-	s.Config = config.Default()
+	s.Config = config.New()
 }
 
 func (s *NetObservSuite) TearDownTest() {
 	s.MockServer.Close()
 }
 
+func (s *NetObservSuite) mustNewClient() *NetObserv {
+	client, err := NewNetObserv(context.Background(), s.Config, s.MockServer.Config(), nil)
+	s.Require().NoError(err)
+	return client
+}
+
+func (s *NetObservSuite) TestBackendLimitRequiresConfig() {
+	_, err := (&NetObserv{}).backendLimit()
+	s.ErrorIs(err, kubernetes.ErrBackendLimitUnavailable)
+}
+
+func (s *NetObservSuite) TestNewNetObserv_NilConfig() {
+	client, err := NewNetObserv(context.Background(), nil, s.MockServer.Config(), nil)
+	s.Nil(client)
+	s.ErrorContains(err, "config is required")
+}
+
+func (s *NetObservSuite) TestNewNetObserv_NilRestConfig() {
+	client, err := NewNetObserv(context.Background(), s.Config, nil, nil)
+	s.Nil(client)
+	s.ErrorContains(err, "kubernetes rest config is required")
+}
+
 func (s *NetObservSuite) TestNewNetObserv_SetsFields() {
-	s.Config = test.Must(config.ReadToml([]byte(`
+	s.Config = test.Must(config.ReadToml(s.T().Context(), []byte(`
 		tls_min_version = "1.3"
 		tls_cipher_suites = ["TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"]
 		[toolset_configs.netobserv]
 		url = "https://netobserv.example/"
 		insecure = true
 	`)))
-	client := NewNetObserv(context.Background(), s.Config, nil, nil)
+	client := s.mustNewClient()
 
 	s.Equal("https://netobserv.example/", client.pluginURL)
 	s.True(client.insecure)
 	s.Equal("1.3", client.tlsMinVersion)
 	s.Equal([]string{"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"}, client.tlsCipherSuites)
+}
+
+func (s *NetObservSuite) TestNewNetObserv_UsesDetectedEndpointFields() {
+	s.Config = test.Must(config.ReadToml(s.T().Context(), []byte(`
+		[toolset_configs.netobserv]
+		loki_mode = "LokiStack"
+	`)))
+	client, err := NewNetObserv(context.Background(), s.Config, s.MockServer.Config(), nil, EffectiveConfig{
+		Found:     true,
+		Namespace: "observability",
+		Service:   "netobserv-console",
+		Port:      9443,
+	})
+	s.Require().NoError(err)
+	s.Equal("https://netobserv-console.observability.svc.cluster.local:9443", client.pluginURL)
+}
+
+func (s *NetObservSuite) TestNewNetObserv_ExplicitEndpointFieldsWinOverDetection() {
+	s.Config = test.Must(config.ReadToml(s.T().Context(), []byte(`
+		[toolset_configs.netobserv]
+		namespace = "manual"
+		service = "manual-service"
+		port = 8080
+	`)))
+	client, err := NewNetObserv(context.Background(), s.Config, s.MockServer.Config(), nil, EffectiveConfig{
+		Found:     true,
+		Namespace: "detected",
+		Service:   "detected-service",
+		Port:      9443,
+	})
+	s.Require().NoError(err)
+	s.Equal("https://manual-service.manual.svc.cluster.local:8080", client.pluginURL)
 }
 
 func (s *NetObservSuite) TestExecuteGet() {
@@ -68,12 +126,11 @@ func (s *NetObservSuite) TestExecuteGet() {
 		seenQuery = r.URL.Query()
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	}))
-	s.Config = test.Must(config.ReadToml([]byte(fmt.Sprintf(`
+	s.Config = test.Must(config.ReadToml(s.T().Context(), []byte(fmt.Sprintf(`
 		[toolset_configs.netobserv]
 		url = "%s"
 	`, s.MockServer.Config().Host))))
-	client := NewNetObserv(context.Background(), s.Config, nil, nil)
-	client.bearerToken = "token-xyz"
+	client := s.mustNewClient()
 
 	content, err := client.ExecuteGet(s.T().Context(), "/api/loki/flow/records", map[string]any{
 		"namespace": "default",
@@ -98,8 +155,9 @@ func (s *NetObservSuite) TestExecuteGet() {
 			s.Equal("Bearer file-sa-token", r.Header.Get("Authorization"))
 			_, _ = w.Write([]byte(`{"status":"ok"}`))
 		}))
-		client := NewNetObserv(context.Background(), s.Config, nil, nil)
-		client.bearerTokenFile = tokenFile
+		s.MockServer.Config().BearerToken = ""
+		s.MockServer.Config().BearerTokenFile = tokenFile
+		client := s.mustNewClient()
 
 		content, err := client.ExecuteGet(s.T().Context(), "/api/loki/flow/records", nil)
 		s.Require().NoError(err)
@@ -107,13 +165,15 @@ func (s *NetObservSuite) TestExecuteGet() {
 	})
 
 	s.Run("returns error when JSON response exceeds maximum allowed size", func() {
+		s.Config.MaxBackendResponseBytes.SetForTest(8)
 		s.MockServer.ResetHandlers()
 		s.MockServer.Handle(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			_, _ = w.Write([]byte(strings.Repeat("x", maxJSONResponseBodySize+1)))
+			_, _ = w.Write([]byte(strings.Repeat("x", 9)))
 		}))
 		_, err := client.ExecuteGet(s.T().Context(), "/api/loki/flow/records", nil)
-		s.Require().Error(err)
-		s.ErrorContains(err, fmt.Sprintf("exceeded maximum allowed size of %d bytes", maxJSONResponseBodySize))
+		var tooLarge *kubernetes.BackendResponseTooLargeError
+		s.Require().ErrorAs(err, &tooLarge)
+		s.Equal(int64(8), tooLarge.Limit)
 	})
 }
 
@@ -123,41 +183,40 @@ func (s *NetObservSuite) TestExecuteGetAccept_csv() {
 		seenAccept = r.Header.Get("Accept")
 		_, _ = w.Write([]byte("col1,col2\na,b"))
 	}))
-	s.Config = test.Must(config.ReadToml([]byte(fmt.Sprintf(`
+	s.Config = test.Must(config.ReadToml(s.T().Context(), []byte(fmt.Sprintf(`
 		[toolset_configs.netobserv]
 		url = "%s"
 	`, s.MockServer.Config().Host))))
-	client := NewNetObserv(context.Background(), s.Config, nil, nil)
+	client := s.mustNewClient()
 
 	response, err := client.ExecuteGetAccept(s.T().Context(), "/api/loki/export", map[string]any{
 		"format": "csv",
-	}, "text/csv,*/*", 2<<20)
+	}, "text/csv,*/*")
 	s.Require().NoError(err)
 	s.Equal("col1,col2\na,b", response.Body)
-	s.False(response.Truncated)
 	s.Equal("text/csv,*/*", seenAccept)
 }
 
-func (s *NetObservSuite) TestExecuteGetAccept_truncatesLargeExports() {
+func (s *NetObservSuite) TestExecuteGetAccept_overCap() {
 	s.MockServer.ResetHandlers()
 	s.MockServer.Handle(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(strings.Repeat("x", 32)))
 	}))
-	s.Config = test.Must(config.ReadToml([]byte(fmt.Sprintf(`
+	s.Config = test.Must(config.ReadToml(s.T().Context(), []byte(fmt.Sprintf(`
+		max_backend_response_bytes = 16
 		[toolset_configs.netobserv]
 		url = "%s"
 	`, s.MockServer.Config().Host))))
-	client := NewNetObserv(context.Background(), s.Config, nil, nil)
+	client := s.mustNewClient()
 
-	response, err := client.ExecuteGetAccept(s.T().Context(), "/api/loki/export", nil, "text/csv,*/*", 16)
+	response, err := client.ExecuteGetAccept(s.T().Context(), "/api/loki/export", nil, "text/csv,*/*")
 	s.Require().NoError(err)
-	s.True(response.Truncated)
-	s.Len(response.Body, 16)
+	s.Equal(strings.Repeat("x", 16)+kubernetes.BackendTruncationNotice, response.Body)
 }
 
-func (s *NetObservSuite) TestNewNetObserv_usesDefaultURLWithoutConfigSection() {
-	client := NewNetObserv(context.Background(), s.Config, nil, nil)
-	s.Equal(DefaultPluginURL(false), client.pluginURL)
+func (s *NetObservSuite) TestNewNetObserv_usesSafeDefaultURLWithoutDiscovery() {
+	client := s.mustNewClient()
+	s.Equal(DefaultPluginURL(true), client.pluginURL)
 }
 
 func (s *NetObservSuite) TestCreateHTTPClient_AppliesTLSSettings() {
@@ -172,14 +231,14 @@ func (s *NetObservSuite) TestCreateHTTPClient_AppliesTLSSettings() {
 	}
 
 	s.Run("uses configured min version and cipher suites", func() {
-		s.Config = test.Must(config.ReadToml([]byte(`
+		s.Config = test.Must(config.ReadToml(s.T().Context(), []byte(`
 			tls_min_version = "1.3"
 			tls_cipher_suites = ["TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"]
 			[toolset_configs.netobserv]
 			url = "https://netobserv.example/"
 			insecure = true
 		`)))
-		client := NewNetObserv(context.Background(), s.Config, nil, nil)
+		client := s.mustNewClient()
 
 		httpClient, err := client.createHTTPClient(s.T().Context())
 		s.Require().NoError(err)
@@ -190,7 +249,7 @@ func (s *NetObservSuite) TestCreateHTTPClient_AppliesTLSSettings() {
 	})
 
 	s.Run("returns error for invalid TLS min version", func() {
-		client := NewNetObserv(context.Background(), s.Config, nil, nil)
+		client := s.mustNewClient()
 		client.tlsMinVersion = "9.9"
 
 		httpClient, err := client.createHTTPClient(s.T().Context())
@@ -202,7 +261,7 @@ func (s *NetObservSuite) TestCreateHTTPClient_AppliesTLSSettings() {
 
 func (s *NetObservSuite) TestRequireTLS_ConfigValidation() {
 	s.Run("rejects HTTP URL when require_tls is enabled", func() {
-		_, err := config.ReadToml([]byte(`
+		_, err := config.ReadToml(s.T().Context(), []byte(`
 			require_tls = true
 			[toolset_configs.netobserv]
 			url = "http://netobserv.example/"
@@ -216,20 +275,56 @@ func (s *NetObservSuite) TestRequireTLS_ConfigValidation() {
 		tempDir := s.T().TempDir()
 		caFile := filepath.Join(tempDir, "ca.crt")
 		s.Require().NoError(os.WriteFile(caFile, []byte("test ca content"), 0644))
-		cfg, err := config.ReadToml([]byte(`
+		cfg, err := config.ReadToml(s.T().Context(), []byte(`
 			require_tls = true
 			[toolset_configs.netobserv]
 			url = "https://netobserv.example/"
 			insecure = false
-			certificate_authority = "` + filepath.ToSlash(caFile) + `"
+			certificate_authority = "`+filepath.ToSlash(caFile)+`"
 		`))
 		s.Require().NoError(err)
 		s.NotNil(cfg)
 	})
+
+	s.Run("rejects require_tls change on reload", func() {
+		tempDir := s.T().TempDir()
+		caFile := filepath.Join(tempDir, "ca.crt")
+		s.Require().NoError(os.WriteFile(caFile, []byte("test ca content"), 0644))
+		caFileForTOML := filepath.ToSlash(caFile)
+		prev, err := config.ReadToml(s.T().Context(), []byte(`
+			require_tls = true
+			[toolset_configs.netobserv]
+			url = "https://netobserv.example/"
+			certificate_authority = "`+caFileForTOML+`"
+		`))
+		s.Require().NoError(err)
+		_, err = config.ReadToml(s.T().Context(), []byte(`
+			require_tls = false
+			[toolset_configs.netobserv]
+			url = "https://netobserv.example/"
+			insecure = true
+			certificate_authority = "`+caFileForTOML+`"
+		`), config.WithPrevious(prev))
+		s.Require().Error(err)
+		s.ErrorContains(err, "non-reloadable option require_tls changed")
+	})
+
+	s.Run("Validate rejects insecure netobserv after require_tls is enabled", func() {
+		cfg, err := config.ReadToml(s.T().Context(), []byte(`
+			[toolset_configs.netobserv]
+			url = "https://netobserv.example/"
+			insecure = true
+		`))
+		s.Require().NoError(err)
+		cfg.RequireTLS.SetForTest(true)
+		err = cfg.ValidateRequireTLS()
+		s.Require().Error(err)
+		s.ErrorContains(err, "insecure=true disables certificate verification")
+	})
 }
 
 func (s *NetObservSuite) TestCreateHTTPClient_failsClosedOnInvalidCA() {
-	client := NewNetObserv(context.Background(), s.Config, nil, nil)
+	client := s.mustNewClient()
 	client.certificateAuthority = filepath.Join(s.T().TempDir(), "missing-ca.crt")
 
 	_, err := client.createHTTPClient(s.T().Context())
@@ -247,23 +342,25 @@ func (s *NetObservSuite) TestExecuteGet_rejectsRedirects() {
 	s.MockServer.Handle(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, redirectTarget.Config().Host+"/stolen", http.StatusFound)
 	}))
-	s.Config = test.Must(config.ReadToml([]byte(fmt.Sprintf(`
+	s.Config = test.Must(config.ReadToml(s.T().Context(), []byte(fmt.Sprintf(`
 		[toolset_configs.netobserv]
 		url = "%s"
 	`, s.MockServer.Config().Host))))
-	client := NewNetObserv(context.Background(), s.Config, nil, nil)
+	client := s.mustNewClient()
 
 	_, err := client.ExecuteGet(s.T().Context(), "/api/loki/flow/records", nil)
 	s.Require().Error(err)
 	s.ErrorContains(err, "redirects are not allowed")
 }
 
-func (s *NetObservSuite) TestNewNetObserv_openShiftProviderUsesHTTPSURL() {
-	// A provider that reports the OpenShift Project GVK must synthesize an https:// URL so the
-	// bearer token is never sent in cleartext. This is also the fail-open direction: on a discovery
-	// error AnyTargetHasGVKs returns true, so this same https path is taken instead of leaking over http.
-	provider := &mockFilteringProvider{hasGVKs: true}
-	client := NewNetObserv(context.Background(), s.Config, nil, provider)
+func (s *NetObservSuite) TestNewNetObserv_openShiftTargetUsesHTTPSURL() {
+	srv := httptest.NewServer(test.NewInOpenShiftHandler())
+	s.T().Cleanup(srv.Close)
+	discoveryClient, err := discovery.NewDiscoveryClientForConfig(&rest.Config{Host: srv.URL})
+	s.Require().NoError(err)
+
+	client, err := NewNetObserv(context.Background(), s.Config, s.MockServer.Config(), discoveryClient)
+	s.Require().NoError(err)
 	s.Equal(DefaultPluginURL(true), client.pluginURL)
 }
 
@@ -279,7 +376,7 @@ func (s *NetObservSuite) TestCreateHTTPClient_pinsProvidedCA() {
 	// Set the URL and CA directly on the client rather than via TOML: a Windows temp path
 	// (C:\Users\...) is not a valid double-quoted TOML string ("\U" is read as an escape).
 	s.Run("verifies against the pinned CA", func() {
-		client := NewNetObserv(context.Background(), s.Config, nil, nil)
+		client := s.mustNewClient()
 		client.pluginURL = srv.URL
 		client.certificateAuthority = pinnedCA
 
@@ -288,7 +385,7 @@ func (s *NetObservSuite) TestCreateHTTPClient_pinsProvidedCA() {
 	})
 
 	s.Run("rejects a server cert not signed by the pinned CA", func() {
-		client := NewNetObserv(context.Background(), s.Config, nil, nil)
+		client := s.mustNewClient()
 		client.pluginURL = srv.URL
 		client.certificateAuthority = s.writeSelfSignedCA()
 

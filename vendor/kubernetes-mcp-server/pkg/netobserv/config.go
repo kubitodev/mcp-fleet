@@ -10,7 +10,6 @@ import (
 	"strings"
 
 	"github.com/BurntSushi/toml"
-	"github.com/containers/kubernetes-mcp-server/pkg/api"
 	"github.com/containers/kubernetes-mcp-server/pkg/config"
 	"github.com/containers/kubernetes-mcp-server/pkg/klogutil"
 )
@@ -24,9 +23,67 @@ type Config struct {
 	Port                 int    `toml:"port,omitempty"`
 	Insecure             bool   `toml:"insecure,omitempty"`
 	CertificateAuthority string `toml:"certificate_authority,omitempty"`
+	// Backend settings are used when FlowCollector autodetection is unavailable.
+	LokiEnabled       *bool  `toml:"loki_enabled,omitempty"`
+	LokiMode          string `toml:"loki_mode,omitempty"`
+	PrometheusEnabled *bool  `toml:"prometheus_enabled,omitempty"`
+	PrometheusMode    string `toml:"prometheus_mode,omitempty"`
 }
 
-var _ api.ExtendedConfig = (*Config)(nil)
+// ToolsetConfigKey is the stable configuration key, independent of any toolset name override.
+const ToolsetConfigKey = "netobserv"
+
+// MergeEffectiveConfig applies explicit backend settings over detected FlowCollector values.
+// Explicit settings take precedence while unspecified fields retain detection results.
+func MergeEffectiveConfig(detected EffectiveConfig, manual *Config) EffectiveConfig {
+	if manual == nil {
+		return detected
+	}
+	if manual.LokiEnabled != nil {
+		detected.Found = true
+		detected.LokiEnabled = *manual.LokiEnabled
+	}
+	if manual.LokiMode != "" {
+		detected.Found = true
+		detected.LokiMode = manual.LokiMode
+		if manual.LokiEnabled == nil {
+			detected.LokiEnabled = true
+		}
+	}
+	if manual.PrometheusEnabled != nil {
+		detected.Found = true
+		detected.PrometheusEnabled = *manual.PrometheusEnabled
+	}
+	if manual.PrometheusMode != "" {
+		detected.Found = true
+		detected.PrometheusMode = manual.PrometheusMode
+		if manual.PrometheusEnabled == nil {
+			detected.PrometheusEnabled = true
+		}
+	}
+	return detected
+}
+
+// ApplyDetectedEndpoint applies detected endpoint fields only when they were not explicitly configured.
+func (c *Config) ApplyDetectedEndpoint(detected EffectiveConfig) {
+	if c == nil || !detected.Found {
+		return
+	}
+	if c.Namespace == "" {
+		c.Namespace = detected.Namespace
+	}
+	if c.Service == "" {
+		c.Service = detected.Service
+	}
+	if c.Port == 0 {
+		c.Port = detected.Port
+	}
+}
+
+var (
+	_ config.ExtendedConfig      = (*Config)(nil)
+	_ config.RequireTLSValidator = (*Config)(nil)
+)
 
 // ResolvedURL returns the plugin base URL, applying operator-aligned defaults when url is unset.
 func (c *Config) ResolvedURL(isOpenShift bool) string {
@@ -102,7 +159,25 @@ func (c *Config) validate(isOpenShift bool) error {
 	return nil
 }
 
-func netobservToolsetParser(ctx context.Context, primitive toml.Primitive, md toml.MetaData) (api.ExtendedConfig, error) {
+func (c *Config) ValidateRequireTLS(requireTLS bool) error {
+	if !requireTLS {
+		return nil
+	}
+	if c == nil {
+		return errors.New("netobserv config is nil")
+	}
+	// Config is validated without a live cluster; assume non-OpenShift (HTTP synthesized URL).
+	const configLoadOpenShift = false
+	if err := config.ValidateURLRequiresTLS(c.ResolvedURL(configLoadOpenShift), "NetObserv URL"); err != nil {
+		return err
+	}
+	if c.Insecure {
+		return errors.New("require_tls is enabled but NetObserv insecure=true disables certificate verification")
+	}
+	return nil
+}
+
+func netobservToolsetParser(ctx context.Context, primitive toml.Primitive, md toml.MetaData) (config.ExtendedConfig, error) {
 	var cfg Config
 	if err := md.PrimitiveDecode(primitive, &cfg); err != nil {
 		return nil, err
@@ -115,16 +190,10 @@ func netobservToolsetParser(ctx context.Context, primitive toml.Primitive, md to
 		}
 	}
 
-	requireTLS := config.RequireTLSFromContext(ctx)
 	// Config is validated without a live cluster; assume non-OpenShift (HTTP synthesized URL).
 	const configLoadOpenShift = false
-	if requireTLS {
-		if err := config.ValidateURLRequiresTLS(cfg.ResolvedURL(configLoadOpenShift), "NetObserv URL"); err != nil {
-			return nil, err
-		}
-		if cfg.Insecure {
-			return nil, errors.New("require_tls is enabled but NetObserv insecure=true disables certificate verification")
-		}
+	if err := cfg.ValidateRequireTLS(config.RequireTLSFromContext(ctx)); err != nil {
+		return nil, err
 	}
 
 	cfg.applyDefaults(ctx, configLoadOpenShift)

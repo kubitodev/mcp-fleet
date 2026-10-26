@@ -1,16 +1,23 @@
 package kiali
 
 import (
+	"context"
 	"slices"
+	"sync"
 
+	"k8s.io/client-go/rest"
 	"k8s.io/utils/ptr"
 
 	"github.com/containers/kubernetes-mcp-server/pkg/api"
+	kialiclient "github.com/containers/kubernetes-mcp-server/pkg/kiali"
+	"github.com/containers/kubernetes-mcp-server/pkg/klogutil"
 	"github.com/containers/kubernetes-mcp-server/pkg/toolsets"
 	"github.com/containers/kubernetes-mcp-server/pkg/toolsets/kiali/internal/defaults"
 	kialiPrompts "github.com/containers/kubernetes-mcp-server/pkg/toolsets/kiali/prompts"
 	kialiTools "github.com/containers/kubernetes-mcp-server/pkg/toolsets/kiali/tools"
 )
+
+var warnKialiValidationDisabledOnce sync.Once
 
 type Toolset struct{}
 
@@ -24,20 +31,19 @@ func (t *Toolset) GetDescription() string {
 	return defaults.ToolsetDescription()
 }
 
-func (t *Toolset) GetTools(_ api.FilteringProvider) []api.ServerTool {
-	tools := slices.Concat(
-		kialiTools.InitGetMeshTrafficGraph(),
-		kialiTools.InitGetMeshStatus(),
-		kialiTools.InitManageIstioConfigRead(),
-		kialiTools.InitManageIstioConfig(),
-		kialiTools.InitListMeshClusters(),
-		kialiTools.InitListOrGetResources(),
-		kialiTools.InitListTraces(),
-		kialiTools.InitGetTraceDetails(),
-		kialiTools.InitGetPodPerformance(),
-		kialiTools.InitGetLogs(),
-		kialiTools.InitGetMetrics(),
-	)
+func (t *Toolset) GetTools(ctx context.Context, toolsetContext api.ToolsetContext) []api.ServerTool {
+	if !toolsetContext.TargetCompatibilityFiltersEnabled {
+		warnKialiValidationDisabledOnce.Do(func() {
+			klogutil.LogWarn(
+				klogutil.FromContext(ctx),
+				"experimental_enable_target_compatibility_tool_filters is disabled; Kiali URL reachability is not validated",
+			)
+		})
+	} else if !kialiAvailable(ctx, toolsetContext) {
+		return nil
+	}
+
+	tools := kialiTools.All(ctx, toolsetContext.Inspector)
 	// Kiali calls a single configured endpoint; mesh scope is selected via meshCluster,
 	// not the provider-level context parameter injected for core Kubernetes tools.
 	for i := range tools {
@@ -46,19 +52,35 @@ func (t *Toolset) GetTools(_ api.FilteringProvider) []api.ServerTool {
 	return tools
 }
 
-func (t *Toolset) GetPrompts() []api.ServerPrompt {
+func kialiAvailable(ctx context.Context, toolsetContext api.ToolsetContext) bool {
+	restConfig := &rest.Config{}
+	if toolsetContext.Inspector != nil {
+		restConfig.BearerToken, _ = toolsetContext.Inspector.BearerToken(ctx).Default()
+	}
+	kiali, err := kialiclient.NewKiali(toolsetContext.Config, restConfig)
+	if err != nil {
+		return false
+	}
+	return kiali.Available(ctx)
+}
+
+func (t *Toolset) GetPrompts(ctx context.Context, toolsetContext api.ToolsetContext) []api.ServerPrompt {
+	if toolsetContext.TargetCompatibilityFiltersEnabled && !kialiAvailable(ctx, toolsetContext) {
+		return nil
+	}
+
 	prompts := slices.Concat(
-		kialiPrompts.InitListApplications(),
+		kialiPrompts.InitListApplications(ctx, toolsetContext.Inspector),
 		kialiPrompts.InitListIstioConfig(),
-		kialiPrompts.InitListNamespaces(),
-		kialiPrompts.InitListServices(),
-		kialiPrompts.InitListWorkloads(),
+		kialiPrompts.InitListNamespaces(ctx, toolsetContext.Inspector),
+		kialiPrompts.InitListServices(ctx, toolsetContext.Inspector),
+		kialiPrompts.InitListWorkloads(ctx, toolsetContext.Inspector),
 		kialiPrompts.InitMeshHealthCheck(),
 		kialiPrompts.InitMeshTopology(),
-		kialiPrompts.InitTrafficTopology(),
+		kialiPrompts.InitTrafficTopology(ctx, toolsetContext.Inspector),
 		kialiPrompts.InitServiceTroubleshoot(),
 		kialiPrompts.InitTraceAnalysis(),
-		kialiPrompts.InitIstioConfigReview(),
+		kialiPrompts.InitIstioConfigReview(ctx, toolsetContext.Inspector),
 	)
 	// Same as tools: mesh scope is not selected via provider context.
 	for i := range prompts {
@@ -67,11 +89,11 @@ func (t *Toolset) GetPrompts() []api.ServerPrompt {
 	return prompts
 }
 
-func (t *Toolset) GetResources() []api.ServerResource {
+func (t *Toolset) GetResources(_ context.Context, _ api.ToolsetContext) []api.ServerResource {
 	return nil
 }
 
-func (t *Toolset) GetResourceTemplates() []api.ServerResourceTemplate {
+func (t *Toolset) GetResourceTemplates(_ context.Context, _ api.ToolsetContext) []api.ServerResourceTemplate {
 	return nil
 }
 
