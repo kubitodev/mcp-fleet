@@ -22,8 +22,8 @@ mcps:
   # ── needs an image (upstream ships none) → we build it ──
   - name: talos-mcp-server
     upstream: https://github.com/Nosmoht/talos-mcp-server
-    ref: v2.5.1
-    commit: "1d2f007ce1ec4dda875a8597c27b0b249d446abc"
+    ref: v2.5.2
+    commit: "265e3f894ed6baf5da4286227754f24752354b5e"
     build: true
     dockerfile: dockerfiles/talos-mcp-server.Dockerfile
   # ── first-party (source in-repo under mcps/, no upstream) → we build it ──
@@ -72,8 +72,8 @@ mcps:
     image: ghcr.io/argoproj-labs/mcp-for-argocd:v0.9.0
   - name: kubernetes-mcp-server
     upstream: https://github.com/containers/kubernetes-mcp-server
-    ref: v0.1.1
-    commit: "26dfd9034dea17571ff34c8999f77de211f0f71a"
+    ref: v0.1.2
+    commit: "66553fed5c16454e5814b41e331b4357f15806d8"
     build: false
     image: ghcr.io/containers/kubernetes-mcp-server:v0.0.66
   - name: mcp-victoriametrics
