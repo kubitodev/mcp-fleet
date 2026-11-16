@@ -85,6 +85,7 @@ docker run -d --name mcp-victoriametrics \
   -e VM_INSTANCE_TYPE=cluster \
   -e MCP_SERVER_MODE=sse \
   -e MCP_LISTEN_ADDR=:8080 \
+  -e MCP_AUTH_TOKEN=your-secret-token \
   -p 8080:8080 \
   ghcr.io/victoriametrics/mcp-victoriametrics
 ```
@@ -143,8 +144,13 @@ MCP Server for VictoriaMetrics is configured via environment variables:
 | `MCP_DISABLED_TOOLS`                     | Comma-separated list of tools to disable                                                                                                                                                                                                                            | No                                     | 'export,flags,metric_relabel_debug,downsampling_filters_debug,retention_filters_debug,test_rules' | -                      |
 | `MCP_DISABLE_RESOURCES`                  | Disable all resources (documentation tool will continue to work)                                                                                                                                                                                                    | No                                     | `false`                                                                                           | `false`, `true`        |                   
 | `MCP_HEARTBEAT_INTERVAL`                 | Defines the heartbeat interval for the streamable-http protocol. <br /> It means the MCP server will send a heartbeat to the client through the GET connection, <br /> to keep the connection alive from being closed by the network infrastructure (e.g. gateways) | No                                     | `30s`                                                                                             | -                      |
+| `MCP_STATELESS`                          | Run the Streamable HTTP server in stateless mode (`http` mode only). Session IDs are ignored instead of validated, so the server does not reject an `Mcp-Session-Id` injected by a fronting platform. Required when hosting behind a proxy that manages sessions for you (e.g. AWS Bedrock AgentCore Runtime). | No | `false` | `false`, `true` |
+| `MCP_DISABLE_LOCALHOST_PROTECTION`       | Disable the Streamable HTTP DNS-rebinding guard (`http` mode only), which otherwise rejects (`403`) any loopback request whose `Host` header is not a localhost value. Set `true` only behind a same-host reverse proxy that forwards over `127.0.0.1` while preserving the original `Host` header (e.g. AWS Bedrock AgentCore Runtime). | No | `false` | `false`, `true` |
+| `MCP_MAX_RESPONSE_SIZE`                  | Maximum size in bytes of a VictoriaMetrics response that a tool reads. A larger response is returned as a tool error instead of being read in full. `0` disables the limit.                                                                                         | No                                     | `16777216`                                                                                        | -                      |
+| `MCP_INSTRUCTIONS_OVERRIDE`              | Text that fully replaces the default MCP server instructions sent to clients. Useful for tailoring the server to a particular instance (environment, tenants, naming conventions, etc.)                                                                             | No                                     | -                                                                                                 | -                      |
+| `MCP_AUTH_TOKEN`                         | Bearer token for authenticating incoming MCP requests (only applies in `sse`/`http` modes). Public paths (`/health/*`, `/metrics`, `/`, static assets) are excluded from authentication.                                                                           | No                                     | -                                                                                                 | -                      |
 | `MCP_LOG_FORMAT`                         | Log output format                                                                                                                                                                                                                                                   | No                                     | `text`                                                                                            | `text`, `json`         |
-| `MCP_LOG_LEVEL`                          | Minimum log level                                                                                                                                                                                                                                                   | No                                     | `info`                                                                                            | `debug`, `info`, `warn`, `error` |
+| `MCP_LOG_LEVEL`                          | Minimum log level. `debug` also logs MCP request and result payloads                                                                                                                                                                                                | No                                     | `info`                                                                                            | `debug`, `info`, `warn`, `error` |
 
 You can use two options to connect to your VictoriaMetrics instance:
 
@@ -158,6 +164,14 @@ MCP Server supports the following modes of operation (transports):
 - `stdio` - Standard input/output mode, where the server reads commands from standard input and writes responses to standard output. This is the default mode and is suitable for local servers.
 - `sse` - Server-Sent Events. Server will expose the `/sse` and `/message` endpoints for SSE connections.
 - `http` - Streamable HTTP. Server will expose the `/mcp` endpoint for HTTP connections.
+
+> **Hosting `http` mode behind a reverse proxy (e.g. AWS Bedrock AgentCore Runtime).**
+> A platform that terminates MCP for you and forwards requests to this server over
+> loopback — injecting its own `Mcp-Session-Id` and preserving the original (non-localhost)
+> `Host` header — needs two toggles, otherwise tool discovery fails (the server crash-loops
+> on session rejection, or returns `403` from the DNS-rebinding guard): set
+> `MCP_STATELESS=true` and `MCP_DISABLE_LOCALHOST_PROTECTION=true` alongside
+> `MCP_SERVER_MODE=http`. Leave both off for direct/local use.
 
 More info about traqnsports you can find in MCP docs:
 
@@ -185,6 +199,9 @@ export VMC_API_KEY="<you-api-key>"
 export MCP_SERVER_MODE="sse"
 export MCP_LISTEN_ADDR="0.0.0.0:8080"
 
+# Authentication (optional, only for sse/http modes)
+export MCP_AUTH_TOKEN="your-secret-token"
+
 # Custom headers for authentication (e.g., behind a reverse proxy)
 # Expected syntax is key=value separated by commas
 export VM_INSTANCE_HEADERS="<HEADER>=<HEADER_VALUE>,<HEADER>=<HEADER_VALUE>"
@@ -205,27 +222,8 @@ In SSE and HTTP modes the MCP server provides the following endpoints:
 
 ## Setup in clients
 
-### Cursor
-
-Go to: `Settings` -> `Cursor Settings` -> `MCP` -> `Add new global MCP server` and paste the following configuration into your Cursor `~/.cursor/mcp.json` file:
-
-```json
-{
-  "mcpServers": {
-    "victoriametrics": {
-      "command": "/path/to/mcp-victoriametrics",
-      "env": {
-        "VM_INSTANCE_ENTRYPOINT": "<YOUR_VM_INSTANCE>",
-        "VM_INSTANCE_TYPE": "<YOUR_VM_INSTANCE_TYPE>",
-        "VM_INSTANCE_BEARER_TOKEN": "<YOUR_VM_BEARER_TOKEN>",
-        "VM_INSTANCE_HEADERS": "<HEADER>=<HEADER_VALUE>,<HEADER>=<HEADER_VALUE>"
-      }
-    }
-  }
-}
-```
-
-See [Cursor MCP docs](https://docs.cursor.com/context/model-context-protocol) for more info.
+<!-- clients:start -->
+<!-- Generated from web/src/clients.yaml by `make update-readme`, do not edit manually. -->
 
 ### Claude Desktop
 
@@ -247,6 +245,19 @@ Add this to your Claude Desktop `claude_desktop_config.json` file (you can find 
 }
 ```
 
+To connect to a server running in [Streamable HTTP](#modes) mode at `http://localhost:8080`:
+
+```json
+{
+  "mcpServers": {
+    "victoriametrics": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "http://localhost:8080/mcp"]
+    }
+  }
+}
+```
+
 See [Claude Desktop MCP docs](https://modelcontextprotocol.io/quickstart/user) for more info.
 
 ### Claude Code
@@ -254,14 +265,55 @@ See [Claude Desktop MCP docs](https://modelcontextprotocol.io/quickstart/user) f
 Run the command:
 
 ```sh
-claude mcp add victoriametrics -- /path/to/mcp-victoriametrics \
+claude mcp add victoriametrics \
   -e VM_INSTANCE_ENTRYPOINT=<YOUR_VM_INSTANCE> \
-  -e VM_INSTANCE_TYPE=<YOUR_VM_INSTANCE_TYPE>
-  -e VM_INSTANCE_BEARER_TOKEN=<YOUR_VM_BEARER_TOKEN>
-  -e VM_INSTANCE_HEADERS="<HEADER>=<HEADER_VALUE>,<HEADER>=<HEADER_VALUE>"
+  -e VM_INSTANCE_TYPE=<YOUR_VM_INSTANCE_TYPE> \
+  -e VM_INSTANCE_BEARER_TOKEN=<YOUR_VM_BEARER_TOKEN> \
+  -e VM_INSTANCE_HEADERS="<HEADER>=<HEADER_VALUE>,<HEADER>=<HEADER_VALUE>" \
+  -- /path/to/mcp-victoriametrics
+```
+
+To connect to a server running in [Streamable HTTP](#modes) mode at `http://localhost:8080`:
+
+```sh
+claude mcp add victoriametrics --transport http http://localhost:8080/mcp
 ```
 
 See [Claude Code MCP docs](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/tutorials#set-up-model-context-protocol-mcp) for more info.
+
+### Cursor
+
+Go to: `Settings` -> `Cursor Settings` -> `MCP` -> `Add new global MCP server` and paste the following configuration into your Cursor `~/.cursor/mcp.json` file:
+
+```json
+{
+  "mcpServers": {
+    "victoriametrics": {
+      "command": "/path/to/mcp-victoriametrics",
+      "env": {
+        "VM_INSTANCE_ENTRYPOINT": "<YOUR_VM_INSTANCE>",
+        "VM_INSTANCE_TYPE": "<YOUR_VM_INSTANCE_TYPE>",
+        "VM_INSTANCE_BEARER_TOKEN": "<YOUR_VM_BEARER_TOKEN>",
+        "VM_INSTANCE_HEADERS": "<HEADER>=<HEADER_VALUE>,<HEADER>=<HEADER_VALUE>"
+      }
+    }
+  }
+}
+```
+
+To connect to a server running in [Streamable HTTP](#modes) mode at `http://localhost:8080`:
+
+```json
+{
+  "mcpServers": {
+    "victoriametrics": {
+      "url": "http://localhost:8080/mcp"
+    }
+  }
+}
+```
+
+See [Cursor MCP docs](https://docs.cursor.com/context/model-context-protocol) for more info.
 
 ### Codex
 
@@ -292,7 +344,7 @@ VM_INSTANCE_BEARER_TOKEN = "<YOUR_VM_BEARER_TOKEN>"
 VM_INSTANCE_HEADERS = "<HEADER>=<HEADER_VALUE>,<HEADER>=<HEADER_VALUE>"
 ```
 
-If you run the server in Streamable HTTP mode, you can register it with:
+To connect to a server running in [Streamable HTTP](#modes) mode at `http://localhost:8080`:
 
 ```sh
 codex mcp add victoriametrics --url http://localhost:8080/mcp
@@ -321,28 +373,53 @@ Add this to your VS Code MCP config file:
 }
 ```
 
-See [VS Code MCP docs](https://code.visualstudio.com/docs/copilot/chat/mcp-servers) for more info.
+To connect to a server running in [Streamable HTTP](#modes) mode at `http://localhost:8080`:
+
+```json
+{
+  "servers": {
+    "victoriametrics": {
+      "type": "http",
+      "url": "http://localhost:8080/mcp"
+    }
+  }
+}
+```
+
+See [Visual Studio Code MCP docs](https://code.visualstudio.com/docs/copilot/chat/mcp-servers) for more info.
 
 ### Zed
 
 Add the following to your Zed config file:
 
 ```json
+"context_servers": {
+  "victoriametrics": {
+    "command": {
+      "path": "/path/to/mcp-victoriametrics",
+      "args": [],
+      "env": {
+        "VM_INSTANCE_ENTRYPOINT": "<YOUR_VM_INSTANCE>",
+        "VM_INSTANCE_TYPE": "<YOUR_VM_INSTANCE_TYPE>",
+        "VM_INSTANCE_BEARER_TOKEN": "<YOUR_VM_BEARER_TOKEN>",
+        "VM_INSTANCE_HEADERS": "<HEADER>=<HEADER_VALUE>,<HEADER>=<HEADER_VALUE>"
+      }
+    },
+    "settings": {}
+  }
+}
+```
+
+To connect to a server running in [Streamable HTTP](#modes) mode at `http://localhost:8080`:
+
+```json
+{
   "context_servers": {
     "victoriametrics": {
-      "command": {
-        "path": "/path/to/mcp-victoriametrics",
-        "args": [],
-        "env": {
-          "VM_INSTANCE_ENTRYPOINT": "<YOUR_VM_INSTANCE>",
-          "VM_INSTANCE_TYPE": "<YOUR_VM_INSTANCE_TYPE>",
-          "VM_INSTANCE_BEARER_TOKEN": "<YOUR_VM_BEARER_TOKEN>",
-          "VM_INSTANCE_HEADERS": "<HEADER>=<HEADER_VALUE>,<HEADER>=<HEADER_VALUE>"
-        }
-      },
-      "settings": {}
+      "url": "http://localhost:8080/mcp"
     }
   }
+}
 ```
 
 See [Zed MCP docs](https://zed.dev/docs/ai/mcp) for more info.
@@ -370,9 +447,21 @@ See [Zed MCP docs](https://zed.dev/docs/ai/mcp) for more info.
 }
 ```
 
+To connect to a server running in [Streamable HTTP](#modes) mode at `http://localhost:8080`:
+
+```json
+{
+  "mcpServers": {
+    "victoriametrics": {
+      "url": "http://localhost:8080/mcp"
+    }
+  }
+}
+```
+
 ### Windsurf
 
-Add the following to your Windsurf MCP config file.
+Add the following to your Windsurf MCP config file:
 
 ```json
 {
@@ -390,7 +479,86 @@ Add the following to your Windsurf MCP config file.
 }
 ```
 
+To connect to a server running in [Streamable HTTP](#modes) mode at `http://localhost:8080`:
+
+```json
+{
+  "mcpServers": {
+    "victoriametrics": {
+      "serverUrl": "http://localhost:8080/mcp"
+    }
+  }
+}
+```
+
 See [Windsurf MCP docs](https://docs.windsurf.com/windsurf/mcp) for more info.
+
+### Gemini CLI
+
+Add the following to your Gemini CLI `~/.gemini/settings.json` file:
+
+```json
+{
+  "mcpServers": {
+    "victoriametrics": {
+      "command": "/path/to/mcp-victoriametrics",
+      "env": {
+        "VM_INSTANCE_ENTRYPOINT": "<YOUR_VM_INSTANCE>",
+        "VM_INSTANCE_TYPE": "<YOUR_VM_INSTANCE_TYPE>",
+        "VM_INSTANCE_BEARER_TOKEN": "<YOUR_VM_BEARER_TOKEN>",
+        "VM_INSTANCE_HEADERS": "<HEADER>=<HEADER_VALUE>,<HEADER>=<HEADER_VALUE>"
+      }
+    }
+  }
+}
+```
+
+To connect to a server running in [Streamable HTTP](#modes) mode at `http://localhost:8080`:
+
+```sh
+gemini mcp add victoriametrics --transport http http://localhost:8080/mcp
+```
+
+See [Gemini CLI MCP docs](https://github.com/google-gemini/gemini-cli/blob/main/docs/tools/mcp-server.md) for more info.
+
+### OpenCode
+
+Add the following to your OpenCode config file in `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "mcp": {
+    "victoriametrics": {
+      "type": "local",
+      "command": ["/path/to/mcp-victoriametrics"],
+      "enabled": true,
+      "environment": {
+        "VM_INSTANCE_ENTRYPOINT": "<YOUR_VM_INSTANCE>",
+        "VM_INSTANCE_TYPE": "<YOUR_VM_INSTANCE_TYPE>",
+        "VM_INSTANCE_BEARER_TOKEN": "<YOUR_VM_BEARER_TOKEN>",
+        "VM_INSTANCE_HEADERS": "<HEADER>=<HEADER_VALUE>,<HEADER>=<HEADER_VALUE>"
+      }
+    }
+  }
+}
+```
+
+To connect to a server running in [Streamable HTTP](#modes) mode at `http://localhost:8080`:
+
+```json
+{
+  "mcp": {
+    "victoriametrics": {
+      "type": "remote",
+      "url": "http://localhost:8080/mcp"
+    }
+  }
+}
+```
+
+See [OpenCode MCP docs](https://opencode.ai/docs/mcp-servers/) for more info.
+
+<!-- clients:end -->
 
 ### Using Docker instead of binary
 
@@ -436,191 +604,209 @@ Use MCP VictoriaMetrics in the following answers
 But it's not required, you can just start asking questions and the assistant will automatically use the tools and documentation to provide you with the best answers.
 Just take a look into [Dialog example](#dialog-example) section for better understanding what you can do with it.
 
-### Toolset
+### Tools and prompts
 
-MCP VictoriaMetrics provides numerous tools for interacting with your VictoriaMetrics instance.
+MCP Server provides numerous tools for interacting with your VictoriaMetrics instance and pre-defined prompts for common tasks.
 
-Here's a list of common available tools:
+<!-- tools:start -->
+<!-- Generated by `make update-readme`, do not edit manually. -->
 
-| Tool                         | Description                                               | Enabled by default |
-|------------------------------|-----------------------------------------------------------|:------------------:|
-| `query`                      | Execute instant PromQL/MetricsQL queries                  |         ✅          |
-| `query_range`                | Execute range PromQL/MetricsQL queries over a time period |         ✅          |
-| `metrics`                    | List available metrics                                    |         ✅          |  
-| `metrics_metadata`           | Stored metrics metadata (type, help and unit)             |         ✅          |
-| `labels`                     | List available label names                                |         ✅          |
-| `label_values`               | List values for a specific label                          |         ✅          |
-| `series`                     | List available time series                                |         ✅          |
-| `export`                     | Export raw time series data to JSON or CSV                |         ❌          |
-| `rules`                      | View alerting and recording rules                         |         ✅          |
-| `alerts`                     | View current alerts (firing and pending)                  |         ✅          |
-| `flags`                      | View non-default flags of the VictoriaMetrics instance    |         ❌          |
-| `metric_statistics`          | Get metrics usage (in queries) statistics                 |         ✅          |
-| `active_queries`             | View currently executing queries                          |         ✅          |
-| `top_queries`                | View most frequent or slowest queries                     |         ✅          |
-| `tsdb_status`                | View TSDB cardinality statistics                          |         ✅          |
-| `tenants`                    | List available tenants in multi-tenant cluster setup      |         ✅          |
-| `documentation`              | Search in embedded VictoriaMetrics documentation          |         ✅          |
-| `metric_relabel_debug`       | Debug Prometheus-compatible relabeling rules              |         ❌          |
-| `downsampling_filters_debug` | Debug downsampling configuration                          |         ❌          |
-| `retention_filters_debug`    | Debug retention filters configuration                     |         ❌          |
-| `prettify_query`             | Prettify and format PromQL/MetricsQL queries              |         ✅          |
-| `explain_query`              | Parse PromQL/MetricsQL queries and explain how it works   |         ✅          |
-| `test_rules`                 | Unit-test alerting and recording rules using vmalert tool |         ❌          |
+Tools:
 
-Here are some additional tools that are available for [VictoriaMetrics Cloud](https://docs.victoriametrics.com/victoriametrics-cloud/) (with specifying `VMC_API_KEY` parameter) users:
+| Tool                         | Description                                            | Enabled by default |
+|------------------------------|--------------------------------------------------------|:------------------:|
+| `active_queries`             | Active queries                                         |         ✅         |
+| `alerts`                     | List of alerts                                         |         ✅         |
+| `documentation`              | Search documentation resources                         |         ✅         |
+| `downsampling_filters_debug` | Downsampling filters debugger                          |         ❌         |
+| `explain_query`              | Explain Query                                          |         ✅         |
+| `export`                     | Export time series                                     |         ❌         |
+| `flags`                      | List of non-default flags (parameters)                 |         ❌         |
+| `label_values`               | List of label values                                   |         ✅         |
+| `labels`                     | List of label names                                    |         ✅         |
+| `metric_relabel_debug`       | Metric relabel debugger                                |         ❌         |
+| `metric_statistics`          | Metric statistics                                      |         ✅         |
+| `metrics`                    | List of metric names                                   |         ✅         |
+| `metrics_metadata`           | List of metrics metadata (name, type, help and unit)   |         ✅         |
+| `prettify_query`             | Prettify Query                                         |         ✅         |
+| `query`                      | Instant Query                                          |         ✅         |
+| `query_range`                | Range Query                                            |         ✅         |
+| `retention_filters_debug`    | Retention filters debugger                             |         ❌         |
+| `rules`                      | List of alerting and recording rules                   |         ✅         |
+| `series`                     | List of time series                                    |         ✅         |
+| `tenants`                    | List of tenants (cluster mode only)                    |         ✅         |
+| `test_rules`                 | Unit test rules                                        |         ❌         |
+| `top_queries`                | Top queries                                            |         ✅         |
+| `tsdb_status`                | TSDB Stats (information about cardinality of the data) |         ✅         |
 
-| Tool              | Description                                                                    | Enabled by default |
-|-------------------|--------------------------------------------------------------------------------|:------------------:|
-| `deployments`     | List available deployments in VictoriaMetrics Cloud                            |         ✅          |
-| `cloud_providers` | List available cloud providers in VictoriaMetrics Cloud                        |         ✅          |
-| `regions`         | List available cloud providers regions in VictoriaMetrics Cloud                |         ✅          |
-| `tiers`           | List available deployment tiers in VictoriaMetrics Cloud                       |         ✅          |
-| `access_tokens`   | List available deployment access tokens in VictoriaMetrics Cloud               |         ✅          |
-| `rule_filenames`  | List available alerting and recording rule filenames in VictoriaMetrics Cloud  |         ✅          |
-| `rule_file`       | Content of a specific alerting or recording rule file in VictoriaMetrics Cloud |         ✅          |
+Prompts:
 
-### Prompts
+| Prompt                                      | Description                                                                           |
+|---------------------------------------------|---------------------------------------------------------------------------------------|
+| `documentation`                             | Search by VictoriaMetrics documentation or give context for answering questions       |
+| `rarely_used_metrics_with_high_cardinality` | List of rarely used metrics with high cardinality in the VictoriaMetrics instance API |
+| `unused_metrics`                            | List of unused (never queried) metrics in the VictoriaMetrics instance API            |
 
-The server includes pre-defined prompts for common tasks.
+#### VictoriaMetrics Cloud
 
-These are just examples at the moment, the prompt library will be added to in the future:
+Additional tools available for [VictoriaMetrics Cloud](https://docs.victoriametrics.com/victoriametrics-cloud/) deployments (with `VMC_API_KEY` parameter).
+In this mode, tools working with data require the `deployment_id` parameter.
 
-| Prompt | Description |
-|--------|-------------|
-| `unused_metrics` | Find metrics that are never queried and create relabel configs to stop ingesting them |
-| `documentation` | Search VictoriaMetrics documentation for specific topics |
-| `rarely_used_metrics_with_high_cardinality` | Identify high-cardinality metrics that are rarely queried |
+| Tool              | Description                                       | Enabled by default |
+|-------------------|---------------------------------------------------|:------------------:|
+| `access_tokens`   | List of deployment access tokens                  |         ✅         |
+| `cloud_providers` | List of cloud providers                           |         ✅         |
+| `deployments`     | List of deployments                               |         ✅         |
+| `regions`         | List of regions                                   |         ✅         |
+| `rule_file`       | Get rules file content                            |         ✅         |
+| `rule_filenames`  | List of filenames of alerting and recording rules |         ✅         |
+| `tiers`           | List of tiers                                     |         ✅         |
+<!-- tools:end -->
 
 ## Dialog example
 
-This is just example of dialog with Assistant using MCP Server that can help to understand how it can work (but's it's real dialog with using the Victoria Metrics MCP server with Claude Desktop and configured to [public playground instance](https://play.victoriametrics.com)):
+Here is an example of a real dialog with the Assistant using the MCP Server with Claude Desktop, configured to work with the [public playground instance](https://play.victoriametrics.com). It shows how the server can help in practice.
 
-- > **You**: What tenants are available in my VM?
-- > **Assistant** *In your VictoriaMetrics instance, the following tenants are available `0:0` (default tenant), `1:0`, `10:0`, `100:0`*
-- > **You**: From now on, please use only default tenant
-- > **Assistant**: *I understand. From now on, I'll use only the default tenant (0:0) for all operations with your VictoriaMetrics instance.*
-- > **You**: Which metrics do we have?
-- > **Assistant**: *There are many metrics available in your VictoriaMetrics instance. The list includes metrics from various systems and components, such as:*
-  >
-  > - *System metrics (`node_`, `machine_`, etc.),*
-  > - *Kubernetes metrics (`kube_`, `container_`, `apiserver_`, etc.),*
-  > - *VictoriaMetrics-specific metrics (`vm_`, `vmagent_`, `vmalert_`, etc.),*
-  > - *Go runtime metrics (`go_`),*
-  > - *Prometheus-related metrics (`scrape_`, `promhttp_`),*
-  > - *Various application metrics (`argocd_`, `alertmanager_`).*
-  >
-  > *This is a comprehensive list of over 2000 metrics that are available for querying. Is there a specific type of metric you're interested in exploring further?*
-- > **You**: Ok, let's work with kubernetes metrics from now on. Please show me which of these metrics never queried?
-- > **Assistant**: *Based on the results, I can see that there are two Kubernetes metrics that have never been queried (query count is 0):*
-  >
-  > - *`kube_persistentvolumeclaim_deletion_timestamp` - This metric provides information about when PersistentVolumeClaims were marked for deletion.*
-  > - *`kube_pod_init_container_status_last_terminated_reason` - This metric shows the reason why init containers in pods were last terminated.*
-  >
-  > *These metrics might be valuable for monitoring and troubleshooting purposes:*
-  >
-  > - *The PVC deletion timestamp metric could help track deletion patterns or identify stuck PVCs.*
-  > - *The init container termination reason metric could help identify common failure patterns in your initialization containers.*
-  >
-  > *Would you like me to explain more about what these metrics track or suggest some useful queries to start monitoring them?*
-- > **You**: Yes, please. And also, can you create relabeling rules to stop ingesting these metrics?
-- > **Assistant**: *I'll create a relabel configuration to exclude these never-queried metrics from collection. This will help reduce storage and processing overhead. Here's the relabel configuration you can add to your VictoriaMetrics scrape configuration:*
-  >
-  > ```yaml
-  > relabel_configs:
-  > - action: drop
-  >   source_labels: [__name__]
-  >   regex: kube_persistentvolumeclaim_deletion_timestamp|kube_pod_init_container_status_last_terminated_reason
-  > ```
-  >
-  > *This configuration will:*
-  > 1. *Look at each metric's name (the `__name__` label)*
-  > 2. *Check if it matches either of the specified metrics*
-  > 3. *Drop the metrics that match, preventing them from being collected and stored*
-  >
-  > *You can add this to your VictoriaMetrics configuration file or to the relevant scrape job configurations in your Prometheus configuration if you're using Prometheus as a scraper for VictoriaMetrics.*
-  > *If you want to test this relabel configuration before implementing it, you can use the metric relabel debug tool to see how it would affect your metrics.*
-- > **You**: Yes, please debug this relabel config on real time series to see how it would affect my metrics
-- > **Assistant**: *Perfect! The relabel config works as expected:*
-  >
-  > - *The first two test cases show that both `kube_persistentvolumeclaim_deletion_timestamp` and `kube_pod_init_container_status_last_terminated_reason` metrics are correctly dropped (resulting labels are empty `{}`).*
-  > - *The third test case confirms that other metrics like `kube_pod_status_phase` are preserved and not affected by our drop rule.*
-  >
-  > *You can confidently add this relabel configuration to your VictoriaMetrics or Prometheus configuration to stop collecting these unused metrics. This will save storage space and reduce processing overhead without affecting your current monitoring capabilities.*
-- > **You**: But i'm using vmagent resource of VictoriaMetrics operator, could you please give me part of specification for my agent with this relabel config?
-- > **Assistant**: *You're right, since you're using the VictoriaMetrics Operator and the VMAgent custom resource, the configuration needs to be in the appropriate format for that CR. Here's how you can add the relabel configuration to your VMAgent specification:*
-  >
-  > ```yaml
-  > apiVersion: operator.victoriametrics.com/v1beta1
-  > kind: VMAgent
-  > metadata:
-  > name: your-vmagent-name
-  > spec:
-  >   # ... your existing configuration ...
-  >   
-  >   # Add this section to configure global metric relabeling
-  >   inlineRelabelConfig:
-  >     - action: drop
-  >       sourceLabels: ["__name__"]
-  >       regex: kube_persistentvolumeclaim_deletion_timestamp|kube_pod_init_container_status_last_terminated_reason
-  >   
-  >   # ... rest of your configuration ...
-  > ```
-  >
-  > *Key points:*
-  >
-  > - *In the VMAgent spec, you use `inlineRelabelConfig` for inline relabeling rules*
-  > - *The field is called `sourceLabels` (not `source_labels` as in Prometheus config)*
-  > - *This is a global relabeling that will be applied to all metrics before they're stored*
-- > **You**: I decided not to remove those metrics, but just lower the sample rate for them using Downsampling. What downsampling parameters i have now?
-- > **Assistant**: *I can see that you currently have the following downsampling configuration:*
-  >
-  > ```
-  > -downsampling.period="7d:1m,30d:5m,180d:30m"
-  > ```
-  >
-  > *This means:*
-  >
-  > - *Data newer than 7 days is kept at its original resolution*
-  > - *Data between 7-30 days old is downsampled to 1-minute resolution*
-  > - *Data between 30-180 days old is downsampled to 5-minute resolution*
-  > - *Data older than 180 days is downsampled to 30-minute resolution*
-  >
-  > *Now, if you want to add specific downsampling rules for those rarely-queried metrics, you can use the downsampling filters debug tool to test how new rules would work. Let's test a configuration where we apply more aggressive downsampling to those specific metrics:*
-  >
-  > *...getting series and using downsampling filter debugger...*
-  >
-  > *Great! Now our test is working correctly. Based on the current configuration and our testing, here's a suggested downsampling configuration for your VMAgent CR that would apply more aggressive downsampling to those rarely-queried metrics:*
-  >
-  > ```yaml
-  > apiVersion: operator.victoriametrics.com/v1beta1
-  > kind: VMCluster
-  > metadata:
-  >   name: monitoring-vm-cluster
-  > spec:
-  >   # ... your existing configuration ...
-  >   
-  >   # Update the vmstorage section with the new downsampling parameters
-  >   vmstorage:
-  >     extraArgs:
-  >       downsampling.period: '{__name__=\"kube_persistentvolumeclaim_deletion_timestamp\"}:1d:10m,{__name__=\"kube_pod_init_container_status_last_terminated_reason\"}:1d:10m,7d:1m,30d:5m,180d:30m'
-  >   
-  >   # ... rest of your configuration ...
-  > ``` 
-  >
-  > *This configuration:*
-  >
-  > *- Applies 10-minute resolution downsampling for the rarely-queried metrics after just 1 day*
-  > *- Maintains your existing downsampling policy for all other metrics*
-  >
-  > *The order of the downsampling rules is important - more specific rules should be listed first.*
+**👤 You:** What tenants are available in my VM?
+
+> 🤖 In your VictoriaMetrics instance, the following tenants are available `0:0` (default tenant), `1:0`, `10:0`, `100:0`
+
+**👤 You:** From now on, please use only default tenant
+
+> 🤖 I understand. From now on, I'll use only the default tenant (0:0) for all operations with your VictoriaMetrics instance.
+
+**👤 You:** Which metrics do we have?
+
+> 🤖 There are many metrics available in your VictoriaMetrics instance. The list includes metrics from various systems and components, such as:
+>
+> - System metrics (`node_`, `machine_`, etc.),
+> - Kubernetes metrics (`kube_`, `container_`, `apiserver_`, etc.),
+> - VictoriaMetrics-specific metrics (`vm_`, `vmagent_`, `vmalert_`, etc.),
+> - Go runtime metrics (`go_`),
+> - Prometheus-related metrics (`scrape_`, `promhttp_`),
+> - Various application metrics (`argocd_`, `alertmanager_`).
+>
+> This is a comprehensive list of over 2000 metrics that are available for querying. Is there a specific type of metric you're interested in exploring further?
+
+**👤 You:** Ok, let's work with kubernetes metrics from now on. Please show me which of these metrics never queried?
+
+> 🤖 Based on the results, I can see that there are two Kubernetes metrics that have never been queried (query count is 0):
+>
+> - `kube_persistentvolumeclaim_deletion_timestamp` - This metric provides information about when PersistentVolumeClaims were marked for deletion.
+> - `kube_pod_init_container_status_last_terminated_reason` - This metric shows the reason why init containers in pods were last terminated.
+>
+> These metrics might be valuable for monitoring and troubleshooting purposes:
+>
+> - The PVC deletion timestamp metric could help track deletion patterns or identify stuck PVCs.
+> - The init container termination reason metric could help identify common failure patterns in your initialization containers.
+>
+> Would you like me to explain more about what these metrics track or suggest some useful queries to start monitoring them?
+
+**👤 You:** Yes, please. And also, can you create relabeling rules to stop ingesting these metrics?
+
+> 🤖 I'll create a relabel configuration to exclude these never-queried metrics from collection. This will help reduce storage and processing overhead. Here's the relabel configuration you can add to your VictoriaMetrics scrape configuration:
+>
+> ```yaml
+> relabel_configs:
+> - action: drop
+>   source_labels: [__name__]
+>   regex: kube_persistentvolumeclaim_deletion_timestamp|kube_pod_init_container_status_last_terminated_reason
+> ```
+>
+> This configuration will:
+> 1. Look at each metric's name (the `__name__` label)
+> 2. Check if it matches either of the specified metrics
+> 3. Drop the metrics that match, preventing them from being collected and stored
+>
+> You can add this to your VictoriaMetrics configuration file or to the relevant scrape job configurations in your Prometheus configuration if you're using Prometheus as a scraper for VictoriaMetrics.
+> If you want to test this relabel configuration before implementing it, you can use the metric relabel debug tool to see how it would affect your metrics.
+
+**👤 You:** Yes, please debug this relabel config on real time series to see how it would affect my metrics
+
+> 🤖 Perfect! The relabel config works as expected:
+>
+> - The first two test cases show that both `kube_persistentvolumeclaim_deletion_timestamp` and `kube_pod_init_container_status_last_terminated_reason` metrics are correctly dropped (resulting labels are empty `{}`).
+> - The third test case confirms that other metrics like `kube_pod_status_phase` are preserved and not affected by our drop rule.
+>
+> You can confidently add this relabel configuration to your VictoriaMetrics or Prometheus configuration to stop collecting these unused metrics. This will save storage space and reduce processing overhead without affecting your current monitoring capabilities.
+
+**👤 You:** But i'm using vmagent resource of VictoriaMetrics operator, could you please give me part of specification for my agent with this relabel config?
+
+> 🤖 You're right, since you're using the VictoriaMetrics Operator and the VMAgent custom resource, the configuration needs to be in the appropriate format for that CR. Here's how you can add the relabel configuration to your VMAgent specification:
+>
+> ```yaml
+> apiVersion: operator.victoriametrics.com/v1beta1
+> kind: VMAgent
+> metadata:
+>   name: your-vmagent-name
+> spec:
+>   # ... your existing configuration ...
+>
+>   # Add this section to configure global metric relabeling
+>   inlineRelabelConfig:
+>     - action: drop
+>       sourceLabels: ["__name__"]
+>       regex: kube_persistentvolumeclaim_deletion_timestamp|kube_pod_init_container_status_last_terminated_reason
+>
+>   # ... rest of your configuration ...
+> ```
+>
+> Key points:
+>
+> - In the VMAgent spec, you use `inlineRelabelConfig` for inline relabeling rules
+> - The field is called `sourceLabels` (not `source_labels` as in Prometheus config)
+> - This is a global relabeling that will be applied to all metrics before they're stored
+
+**👤 You:** I decided not to remove those metrics, but just lower the sample rate for them using Downsampling. What downsampling parameters i have now?
+
+> 🤖 I can see that you currently have the following downsampling configuration:
+>
+> ```
+> -downsampling.period="7d:1m,30d:5m,180d:30m"
+> ```
+>
+> This means:
+>
+> - Data newer than 7 days is kept at its original resolution
+> - Data between 7-30 days old is downsampled to 1-minute resolution
+> - Data between 30-180 days old is downsampled to 5-minute resolution
+> - Data older than 180 days is downsampled to 30-minute resolution
+>
+> Now, if you want to add specific downsampling rules for those rarely-queried metrics, you can use the downsampling filters debug tool to test how new rules would work. Let's test a configuration where we apply more aggressive downsampling to those specific metrics:
+>
+> *...getting series and using downsampling filter debugger...*
+>
+> Great! Now our test is working correctly. Based on the current configuration and our testing, here's a suggested downsampling configuration for your VMAgent CR that would apply more aggressive downsampling to those rarely-queried metrics:
+>
+> ```yaml
+> apiVersion: operator.victoriametrics.com/v1beta1
+> kind: VMCluster
+> metadata:
+>   name: monitoring-vm-cluster
+> spec:
+>   # ... your existing configuration ...
+>
+>   # Update the vmstorage section with the new downsampling parameters
+>   vmstorage:
+>     extraArgs:
+>       downsampling.period: '{__name__=\"kube_persistentvolumeclaim_deletion_timestamp\"}:1d:10m,{__name__=\"kube_pod_init_container_status_last_terminated_reason\"}:1d:10m,7d:1m,30d:5m,180d:30m'
+>
+>   # ... rest of your configuration ...
+> ```
+>
+> This configuration:
+>
+> - Applies 10-minute resolution downsampling for the rarely-queried metrics after just 1 day
+> - Maintains your existing downsampling policy for all other metrics
+>
+> The order of the downsampling rules is important - more specific rules should be listed first.
 
 During this dialog, the assistant was using the following tools:
 
 - `tenants` to get the list of available tenants
 - `documentation` to get information about functionality and data formats
 - `metrics` to get the list of available metrics
-- `metrics_staistics` to get the information about metrics usage
+- `metric_statistics` to get the information about metrics usage
 - `series` to get the time series for debugging
 - `metric_relabel_debug` to debug relabeling rules
 - `flags` to get the information about instance parameters
@@ -661,7 +847,7 @@ You can use `MCP_PASSTHROUGH_HEADERS` parameter in the MCP Server together with 
 - [x] Enabling/disabling tools via configuration (done in [`v0.0.8`](https://github.com/VictoriaMetrics/mcp-victoriametrics/releases/tag/v0.0.8))
 - [ ] Tools for Alertmanager APIs [#6](https://github.com/VictoriaMetrics/mcp-victoriametrics/issues/6)
 - [x] Support for [metrics metadata](https://github.com/VictoriaMetrics/VictoriaMetrics/issues/2974) in case of implementation in VictoriaMetrics
-- [ ] Support authentication
+- [x] Support authentication
 - [x] Add static index page with description and links to documentation
 
 ## Mentions

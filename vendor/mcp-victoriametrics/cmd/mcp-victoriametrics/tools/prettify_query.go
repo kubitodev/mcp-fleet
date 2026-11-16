@@ -36,12 +36,7 @@ func toolPrettifyQuery(c *config.Config) mcp.Tool {
 	if c.IsCluster() || c.IsCloud() {
 		options = append(
 			options,
-			mcp.WithString("tenant",
-				mcp.Title("Tenant name"),
-				mcp.Description("Name of the tenant for which the data will be displayed"),
-				mcp.DefaultString("0"),
-				mcp.Pattern(`^([0-9]+)(:[0-9]+)?$`),
-			),
+			withTenantParam("Name of the tenant for which the data will be displayed"),
 		)
 	}
 	options = append(
@@ -94,7 +89,7 @@ func toolPrettifyQueryHandler(ctx context.Context, cfg *config.Config, tcr mcp.C
 	return GetTextBodyForRequest(req, cfg), nil
 }
 
-func RegisterToolPrettifyQuery(s *server.MCPServer, c *config.Config) {
+func registerToolPrettifyQuery(s *server.MCPServer, c *config.Config) {
 	if c.IsToolDisabled(toolNamePrettifyQuery) {
 		return
 	}

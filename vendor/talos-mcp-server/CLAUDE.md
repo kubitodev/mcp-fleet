@@ -6,7 +6,7 @@ MCP server exposing Talos Linux cluster management to AI agents via the native g
 
 ```bash
 make build   # binary with version info
-make check   # full CI parity: fmt + vet + lint + test
+make check   # full CI parity: fmt + vet + lint + arch-lint + test
 ```
 
 ## Safety
@@ -26,7 +26,7 @@ Quorum/member-count invariants for preflight helpers: see `.claude/rules/quorum-
 
 ### Safety Profile
 
-`TALOS_MCP_SAFETY_PROFILE` seeds five gating flags at startup. Individual env vars override the profile. When the profile var is unset, each flag defaults to its own env var (backwards-compatible).
+`TALOS_MCP_SAFETY_PROFILE` seeds the gating flags in the table below at startup. Individual env vars override the profile. When the profile var is unset, each flag defaults to its own env var (backwards-compatible).
 
 | Profile | `READ_ONLY` | `ALLOW_CLUSTER_WIDE` | `ENABLE_GEN` | `SKIP_VERSION_CHECK` | `ENABLE_INSECURE` |
 |---|---|---|---|---|---|
@@ -58,7 +58,7 @@ git worktree add -b feat/<slug> .claude/worktrees/<slug> origin/main
 
 Issue lifecycle, agent tooling, planning discipline, coding conventions, and multi-agent coordination: [AGENTS.md](./AGENTS.md).
 
-Find ready issues: `repo:Nosmoht/talos-mcp-server is:issue is:open label:"status: ready" sort:created-asc`
+Find ready issues: `repo:Nosmoht/talos-mcp-server is:issue is:open label:"status: ready" -label:"status: blocked" sort:created-asc`
 
 ## Release
 
@@ -68,19 +68,13 @@ npm OIDC gotchas: see `.claude/rules/release-workflow.md` (auto-loaded when edit
 
 ## GitHub Issues
 
-Use `--body-file` for issue bodies with backticks — heredocs with `--body` corrupt markdown code blocks.
-
-**Bug/chore body sections:** `## Description` · `## Evidence` · `## Impact` · `## Recommended Fix` · `## Audit Source`
-
-**Feature request body sections:** `### Severity` · `### Category` · `### Description` · `### Evidence` · `### Impact` · `### Recommended Fix` · `### Audit Source`
-
-Minimum labels: one `type:`, one `priority:`, `needs: triage`. Full taxonomy: [AGENTS.md § Label Rules](./AGENTS.md).
+Issue body structure, creation labels and triage: [AGENTS.md § Label Rules › Creating issues](./AGENTS.md#creating-issues) and [§ Triage](./AGENTS.md#triage).
 
 ## Change Governance
 
 Every change to tracked files requires a review artifact before commit.
 
-Invoke `staff-reviewer` after implementing. Artifact: `.claude/reviews/<change-id>/review.md`
+Invoke `staff-reviewer` after implementing. Artifact: `.claude/reviews/<change-id>/review.md` in the main checkout (also for worktree commits) — how to invoke reviewers: [AGENTS.md § Review flow](./AGENTS.md#review-flow).
 - `status: approved` → commit · `status: escalate` → invoke each listed reviewer
 
 Full review flow and escalation criteria: [AGENTS.md § Review Governance](./AGENTS.md#review-governance).
@@ -93,7 +87,7 @@ Review artifacts (`.claude/reviews/`) are **gitignored local-only** process gate
 cp .claude/hooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
 ```
 
-`.claude/settings.json` hooks block `git commit` (Bash) and MCP GitHub push tools without a valid review artifact. The implementing agent must not review the same change. When uncertain about API behavior or prior decisions: invoke the `researcher` agent.
+`.claude/settings.json` hooks block `git commit` (Bash) and MCP GitHub push tools without a valid review artifact. The implementing agent must not review the same change. When uncertain about API behavior or prior decisions: invoke the `talos-researcher` agent.
 
 ## Configuration
 

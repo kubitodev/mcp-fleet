@@ -213,7 +213,7 @@ log_level = 2
 read_only = true
 toolsets = ["core", "config", "helm", "kubevirt"]
 
-# Deny access to sensitive resources
+# Reject Secret requests made by this server's Kubernetes client
 [[denied_resources]]
 group = ""
 version = "v1"
@@ -223,12 +223,14 @@ kind = "Secret"
 endpoint = "http://localhost:4317"
 ```
 
+`read_only` and `denied_resources` are best-effort guardrails. Kubernetes RBAC on the identity this server authenticates as is the access control to rely on. See [Cluster authorization](docs/configuration.md#cluster-authorization).
+
 For comprehensive TOML configuration documentation, including:
 
 - All configuration options and their defaults
 - Drop-in configuration files for modular settings
 - Dynamic configuration reload via SIGHUP
-- Denied resources for restricting access to sensitive resource types
+- [Cluster authorization](docs/configuration.md#cluster-authorization) for `read_only`, `denied_resources`, and the other guardrails
 - Server instructions for MCP Tool Search
 - [Custom MCP prompts](docs/prompts.md)
 - OAuth/OIDC authentication for HTTP mode ([Keycloak](docs/KEYCLOAK_OIDC_SETUP.md), [Microsoft Entra ID](docs/ENTRA_ID_SETUP.md))
@@ -412,7 +414,7 @@ In case multi-cluster support is enabled (default) and you have access to multip
 
 - **resources_create_or_update** - Create or update a Kubernetes resource via Server-Side Apply. The manifest is the complete desired state: any field this tool previously set and the new manifest omits is removed. To edit an existing resource, fetch it with resources_get, modify it, then re-apply the full resource.
 (common apiVersion and kind include: v1 Pod, v1 Service, v1 Node, apps/v1 Deployment, networking.k8s.io/v1 Ingress, route.openshift.io/v1 Route)
-  - `resource` (`string`) **(required)** - Complete YAML or JSON representation of the Kubernetes resource (full desired state, not a partial patch). Include apiVersion, kind, metadata, and the full spec.
+  - `resource` (`string`) **(required)** - Complete YAML or JSON representation of the Kubernetes resource (full desired state, not a partial patch). Include apiVersion, kind, metadata, and the full spec. For namespaced resources, include metadata.namespace to specify the target namespace; if omitted, the configured default namespace is used
 
 - **resources_delete** - Delete a Kubernetes resource in the current cluster by providing its apiVersion, kind, optionally the namespace, and its name
 (common apiVersion and kind include: v1 Pod, v1 Service, v1 Node, apps/v1 Deployment, networking.k8s.io/v1 Ingress, route.openshift.io/v1 Route)

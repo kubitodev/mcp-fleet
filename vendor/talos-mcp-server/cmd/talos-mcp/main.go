@@ -14,9 +14,10 @@
 //   - TALOS_MCP_ENABLE_GEN: set to "true" to register offline gen_* tools
 //     (reserved for Phase E; no tools consume the flag yet)
 //   - TALOS_MCP_SAFETY_PROFILE: conservative|standard|expert preset that seeds
-//     the four gating flags above. Individual flags override the profile. When
-//     unset, the four flags default to their individual-env-var values
-//     (backwards-compatible).
+//     TALOS_MCP_READ_ONLY, TALOS_MCP_ALLOW_CLUSTER_WIDE, TALOS_MCP_ENABLE_GEN,
+//     TALOS_MCP_SKIP_VERSION_CHECK and TALOS_MCP_ENABLE_INSECURE. Individual
+//     flags override the profile. When unset, each flag defaults to its own
+//     env var (backwards-compatible).
 //   - TALOS_MCP_HTTP_ADDR: if set (e.g. ":8080"), serve HTTP instead of stdio
 //   - TALOS_MCP_AUTH_TOKEN: required bearer token when HTTP mode is active
 //   - TALOS_MCP_ALLOWED_NODES: comma-separated list of permitted node IPs, hostnames,
@@ -94,61 +95,8 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	safety, err := config.LoadSafetyProfile()
+	cfg, err := loadStartupConfig()
 	if err != nil {
-		stop()
-		log.Fatalf("%v", err) //nolint:gocritic // exitAfterDefer: stop() called explicitly above
-	}
-	readOnly := safety.ReadOnly
-	skipVersionCheck := safety.SkipVersionCheck
-
-	httpAddr := os.Getenv("TALOS_MCP_HTTP_ADDR")
-	authToken := os.Getenv("TALOS_MCP_AUTH_TOKEN")
-	os.Unsetenv("TALOS_MCP_AUTH_TOKEN") //nolint:errcheck // remove token from /proc/<pid>/environ
-
-	allowedNodes, err := talos.ParseNodeAllowlist(os.Getenv("TALOS_MCP_ALLOWED_NODES"))
-	if err != nil {
-		stop()
-		log.Fatalf("invalid TALOS_MCP_ALLOWED_NODES: %v", err) //nolint:gocritic // exitAfterDefer: stop() called explicitly above
-	}
-
-	allowedPaths := tools.ParseAllowedPaths(os.Getenv("TALOS_MCP_ALLOWED_PATHS"))
-	blockedConfigPaths := splitNonEmpty(os.Getenv("TALOS_MCP_BLOCKED_CONFIG_PATHS"), ",")
-
-	// Maintenance-mode (insecure) configuration. The allowlist is REQUIRED
-	// when EnableInsecure is true — the unauthenticated transport relies on
-	// it as the only network-layer defence. main.go log.Fatalf-s rather than
-	// silently treating an unset allowlist as "no restriction".
-	var (
-		insecureAllowedNodes *talos.NodeAllowlist
-		insecureBroadEntries []string
-	)
-	if safety.EnableInsecure {
-		rawAllowlist := os.Getenv("TALOS_MCP_INSECURE_ALLOWED_NODES")
-		inspection, err := config.CheckInsecureAllowlist(rawAllowlist)
-		if err != nil {
-			stop()
-			log.Fatalf("%v", err) //nolint:gocritic // exitAfterDefer: stop() called explicitly above
-		}
-		insecureBroadEntries = inspection.BroadEntries
-		insecureAllowedNodes, err = talos.ParseNodeAllowlist(rawAllowlist)
-		if err != nil {
-			stop()
-			log.Fatalf("invalid TALOS_MCP_INSECURE_ALLOWED_NODES: %v", err) //nolint:gocritic // exitAfterDefer: stop() called explicitly above
-		}
-		if insecureAllowedNodes == nil || insecureAllowedNodes.Len() == 0 {
-			stop()
-			log.Fatalf("TALOS_MCP_INSECURE_ALLOWED_NODES yielded no entries: cannot enable insecure mode") //nolint:gocritic // exitAfterDefer
-		}
-	}
-
-	metaPrivilegedKeys, err := config.ParseMetaPrivilegedKeys(os.Getenv("TALOS_MCP_META_PRIVILEGED_KEYS"))
-	if err != nil {
-		stop()
-		log.Fatalf("%v", err) //nolint:gocritic // exitAfterDefer: stop() called explicitly above
-	}
-
-	if err := validateHTTPConfig(httpAddr, authToken); err != nil {
 		stop()
 		log.Fatalf("%v", err) //nolint:gocritic // exitAfterDefer: stop() called explicitly above
 	}
@@ -160,76 +108,20 @@ func main() {
 	}
 	defer tc.Close() //nolint:errcheck
 
-	slog.Info("talos-mcp started", "version", version, "commit", commit, "date", date, "read_only", readOnly) //nolint:gosec // G706 false positive: version/commit/date are build-time ldflags constants injected by GoReleaser, not runtime user input
-	slog.Info("safety profile", safety.LogFields()...)
-
-	// Best-effort cluster version compatibility check. Non-fatal — the server
-	// starts regardless and operators can set TALOS_MCP_SKIP_VERSION_CHECK=true
-	// to suppress validation warnings.
-	if cv, err := tc.GetClusterVersion(ctx); err != nil {
-		slog.Warn("could not detect cluster Talos version", "error", err)
-	} else if !cv.InSupportedRange() {
-		slog.Warn("cluster Talos version is outside the tested range; some features may not work correctly",
-			"version", cv.String(),
-			"min_supported", talosversion.MinSupported.String(),
-			"max_tested", talosversion.MaxTested.String(),
-		)
-	} else {
-		slog.Info("cluster Talos version", "version", cv.String(), "status", "supported")
-	}
-
-	if allowedNodes != nil {
-		slog.Info("node allowlist active", "entries", allowedNodes.Len()) //nolint:gosec // G706: entry count is an integer, not user-controlled string input
-	} else {
-		slog.Info("node allowlist disabled")
-	}
-
-	if len(allowedPaths) > 0 {
-		slog.Info("path allowlist active", "entries", len(allowedPaths)) //nolint:gosec // G706: entry count is an integer, not user-controlled string input
-		slog.Warn("path allowlist is defense-in-depth only: the prefix check runs on the MCP server host and does not resolve symlinks on the remote node, so a symlink under an allowed prefix that points elsewhere is not detected")
-	} else {
-		slog.Info("path allowlist disabled")
-	}
-
-	if skipVersionCheck {
-		slog.Warn("version check disabled (TALOS_MCP_SKIP_VERSION_CHECK=true)")
-	}
-
-	if len(blockedConfigPaths) > 0 {
-		slog.Info("config path blocklist active", "entries", len(blockedConfigPaths)) //nolint:gosec // G706: entry count is an integer, not user-controlled string input
-	} else {
-		slog.Info("config path blocklist disabled")
-	}
-
-	if safety.EnableInsecure {
-		//nolint:gosec // G706: message is a constant; fields are integer count and operator-supplied CIDR, not user input
-		slog.Warn("maintenance-mode (insecure) operations ENABLED — bypasses mTLS; ensure the allowlist is tight",
-			"allowlist_entries", insecureAllowedNodes.Len(),
-		)
-		for _, broad := range insecureBroadEntries {
-			//nolint:gosec // G706: message is a constant; cidr is operator-supplied config, not user input
-			slog.Warn("insecure allowlist entry is broader than recommended", "cidr", broad)
-		}
-	} else {
-		slog.Info("maintenance-mode (insecure) operations disabled")
-	}
-
-	if len(metaPrivilegedKeys) > 0 {
-		//nolint:gosec // G706: message is a constant; field is an integer count, not user input
-		slog.Warn("META privileged-key safelist active — these keys are writable beyond UserReserved1/2/3",
-			"key_count", len(metaPrivilegedKeys),
-		)
-	}
+	slog.Info("talos-mcp started", "version", version, "commit", commit, "date", date, "read_only", cfg.safety.ReadOnly) //nolint:gosec // G706 false positive: version/commit/date are build-time ldflags constants injected by GoReleaser, not runtime user input
+	slog.Info("safety profile", cfg.safety.LogFields()...)
+	logClusterVersion(ctx, tc)
+	cfg.logGuards()
 
 	h := &tools.Handlers{
 		Client:               tc,
-		AllowedNodes:         allowedNodes,
-		AllowedPaths:         allowedPaths,
-		SkipVersionCheck:     skipVersionCheck,
-		BlockedConfigPaths:   blockedConfigPaths,
-		EnableInsecure:       safety.EnableInsecure,
-		InsecureAllowedNodes: insecureAllowedNodes,
-		MetaPrivilegedKeys:   metaPrivilegedKeys,
+		AllowedNodes:         cfg.allowedNodes,
+		AllowedPaths:         cfg.allowedPaths,
+		SkipVersionCheck:     cfg.safety.SkipVersionCheck,
+		BlockedConfigPaths:   cfg.blockedConfigPaths,
+		EnableInsecure:       cfg.safety.EnableInsecure,
+		InsecureAllowedNodes: cfg.insecureAllowedNodes,
+		MetaPrivilegedKeys:   cfg.metaPrivilegedKeys,
 	}
 
 	subRate, subBurst, err := parseSubscriptionLimits(os.Getenv("TALOS_MCP_SUBSCRIPTION_RATE"), os.Getenv("TALOS_MCP_SUBSCRIPTION_BURST"))
@@ -237,8 +129,169 @@ func main() {
 		stop()
 		log.Fatalf("%v", err) //nolint:gocritic // exitAfterDefer: stop() called explicitly above
 	}
-	subMgr := subscriptions.NewManager(tc, allowedNodes, subRate, subBurst)
+	server, subMgr := newServer(h, serverConfig{
+		ReadOnly:           cfg.safety.ReadOnly,
+		SubscriptionRate:   subRate,
+		SubscriptionBurst:  subBurst,
+		ResourceClient:     tc,
+		SubscriptionSource: tc,
+	})
 	defer subMgr.Shutdown()
+
+	if err := runServer(ctx, server, cfg.httpAddr, cfg.authToken, newHTTPTransportConfig(), tc.Ping); err != nil {
+		slog.Error("server stopped with error", "error", err)
+	}
+}
+
+type startupConfig struct {
+	safety               *config.SafetyProfile
+	httpAddr             string
+	authToken            string
+	allowedNodes         *talos.NodeAllowlist
+	allowedPaths         []string
+	blockedConfigPaths   []string
+	insecureAllowedNodes *talos.NodeAllowlist
+	insecureBroadEntries []string
+	metaPrivilegedKeys   map[uint8]struct{}
+}
+
+func loadStartupConfig() (*startupConfig, error) {
+	safety, err := config.LoadSafetyProfile()
+	if err != nil {
+		return nil, err
+	}
+
+	cfg := &startupConfig{
+		safety:    safety,
+		httpAddr:  os.Getenv("TALOS_MCP_HTTP_ADDR"),
+		authToken: os.Getenv("TALOS_MCP_AUTH_TOKEN"),
+	}
+	os.Unsetenv("TALOS_MCP_AUTH_TOKEN") //nolint:errcheck // remove token from /proc/<pid>/environ
+
+	if cfg.allowedNodes, err = talos.ParseNodeAllowlist(os.Getenv("TALOS_MCP_ALLOWED_NODES")); err != nil {
+		return nil, fmt.Errorf("invalid TALOS_MCP_ALLOWED_NODES: %w", err)
+	}
+
+	cfg.allowedPaths = tools.ParseAllowedPaths(os.Getenv("TALOS_MCP_ALLOWED_PATHS"))
+	cfg.blockedConfigPaths = splitNonEmpty(os.Getenv("TALOS_MCP_BLOCKED_CONFIG_PATHS"), ",")
+
+	if safety.EnableInsecure {
+		if cfg.insecureAllowedNodes, cfg.insecureBroadEntries, err = loadInsecureAllowlist(); err != nil {
+			return nil, err
+		}
+	}
+
+	if cfg.metaPrivilegedKeys, err = talos.ParseMetaPrivilegedKeys(os.Getenv("TALOS_MCP_META_PRIVILEGED_KEYS")); err != nil {
+		return nil, err
+	}
+
+	if err := validateHTTPConfig(cfg.httpAddr, cfg.authToken); err != nil {
+		return nil, err
+	}
+
+	return cfg, nil
+}
+
+func loadInsecureAllowlist() (*talos.NodeAllowlist, []string, error) {
+	rawAllowlist := os.Getenv("TALOS_MCP_INSECURE_ALLOWED_NODES")
+
+	inspection, err := config.CheckInsecureAllowlist(rawAllowlist)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	allowlist, err := talos.ParseNodeAllowlist(rawAllowlist)
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid TALOS_MCP_INSECURE_ALLOWED_NODES: %w", err)
+	}
+
+	if allowlist == nil || allowlist.Len() == 0 {
+		return nil, nil, errors.New("TALOS_MCP_INSECURE_ALLOWED_NODES yielded no entries: cannot enable insecure mode")
+	}
+
+	return allowlist, inspection.BroadEntries, nil
+}
+
+func logClusterVersion(ctx context.Context, tc *talos.Client) {
+	cv, err := tc.GetClusterVersion(ctx)
+	switch {
+	case err != nil:
+		slog.Warn("could not detect cluster Talos version", "error", err)
+	case !cv.InSupportedRange():
+		slog.Warn("cluster Talos version is outside the tested range; some features may not work correctly",
+			"version", cv.String(),
+			"min_supported", talosversion.MinSupported.String(),
+			"max_tested", talosversion.MaxTested.String(),
+		)
+	default:
+		slog.Info("cluster Talos version", "version", cv.String(), "status", "supported")
+	}
+}
+
+func (cfg *startupConfig) logGuards() {
+	if cfg.allowedNodes != nil {
+		slog.Info("node allowlist active", "entries", cfg.allowedNodes.Len()) //nolint:gosec // G706: entry count is an integer, not user-controlled string input
+	} else {
+		slog.Info("node allowlist disabled")
+	}
+
+	if len(cfg.allowedPaths) > 0 {
+		slog.Info("path allowlist active", "entries", len(cfg.allowedPaths)) //nolint:gosec // G706: entry count is an integer, not user-controlled string input
+		slog.Warn("path allowlist is defense-in-depth only: the prefix check runs on the MCP server host and does not resolve symlinks on the remote node, so a symlink under an allowed prefix that points elsewhere is not detected")
+	} else {
+		slog.Info("path allowlist disabled")
+	}
+
+	if cfg.safety.SkipVersionCheck {
+		slog.Warn("version check disabled (TALOS_MCP_SKIP_VERSION_CHECK=true)")
+	}
+
+	if len(cfg.blockedConfigPaths) > 0 {
+		slog.Info("config path blocklist active", "entries", len(cfg.blockedConfigPaths)) //nolint:gosec // G706: entry count is an integer, not user-controlled string input
+	} else {
+		slog.Info("config path blocklist disabled")
+	}
+
+	cfg.logInsecureMode()
+
+	if len(cfg.metaPrivilegedKeys) > 0 {
+		//nolint:gosec // G706: message is a constant; field is an integer count, not user input
+		slog.Warn("META privileged-key safelist active — these keys are writable beyond UserReserved1/2/3",
+			"key_count", len(cfg.metaPrivilegedKeys),
+		)
+	}
+}
+
+func (cfg *startupConfig) logInsecureMode() {
+	if !cfg.safety.EnableInsecure {
+		slog.Info("maintenance-mode (insecure) operations disabled")
+		return
+	}
+
+	//nolint:gosec // G706: message is a constant; fields are integer count and operator-supplied CIDR, not user input
+	slog.Warn("maintenance-mode (insecure) operations ENABLED — bypasses mTLS; ensure the allowlist is tight",
+		"allowlist_entries", cfg.insecureAllowedNodes.Len(),
+	)
+	for _, broad := range cfg.insecureBroadEntries {
+		//nolint:gosec // G706: message is a constant; cidr is operator-supplied config, not user input
+		slog.Warn("insecure allowlist entry is broader than recommended", "cidr", broad)
+	}
+}
+
+// serverConfig carries the inputs of newServer that do not live on tools.Handlers.
+type serverConfig struct {
+	ReadOnly           bool
+	SubscriptionRate   time.Duration
+	SubscriptionBurst  int
+	ResourceClient     resources.Client
+	SubscriptionSource subscriptions.Source
+}
+
+// newServer builds the MCP server with all registrations and the subscription
+// manager. Production and tests share it, so fixtures cannot drift from the
+// production wiring — same drift class as newStreamableHTTPOptions.
+func newServer(h *tools.Handlers, cfg serverConfig) (*mcp.Server, *subscriptions.Manager) {
+	subMgr := subscriptions.NewManager(cfg.SubscriptionSource, h.AllowedNodes, cfg.SubscriptionRate, cfg.SubscriptionBurst)
 
 	serverOpts := &mcp.ServerOptions{
 		Instructions: "Talos Linux cluster management. Choose a tool by what you need:\n" +
@@ -249,45 +302,18 @@ func main() {
 			"- kernel messages → talos_dmesg; runtime/lifecycle events → talos_events\n" +
 			"- containers → talos_containers; host processes → talos_processes\n" +
 			"- files on a node → talos_list_files / talos_read_file\n" +
-			"- anything else (network, MachineStatus, …) → talos_get " +
-			"(query one node at a time; talos_resource_definitions lists the types).\n" +
-			"All tools take an optional 'nodes' field (node IPs); omit it to use the active context from talosconfig. " +
-			"Mutating tools differ by family: talos_reboot, talos_upgrade, talos_rollback and talos_reset require confirm=true AND explicit nodes (they will not guess a target). " +
-			"talos_service_action requires confirm=true and, when nodes is omitted, fans out to the talosconfig default nodes — pass nodes to scope it. " +
-			"talos_patch_config and talos_apply_config target exactly one node and default to dry_run=true; confirm=true is required only for a real apply (dry_run=false). " +
-			"talos_meta requires confirm=true only for write/delete. " +
+			"- anything else (network, MachineStatus, …) → talos_get; talos_resource_definitions lists the types\n" +
+			"Each tool's description documents its guard parameters and node scope. " +
 			"The talos:// MCP Resources mirror talos_get/talos_version for clients that prefer resources — the tools are the simpler path.",
-		CompletionHandler:  completions.NewHandler(allowedNodes),
+		CompletionHandler:  completions.NewHandler(h.AllowedNodes),
 		SubscribeHandler:   subMgr.Subscribe,
 		UnsubscribeHandler: subMgr.Unsubscribe,
-	}
-
-	// Wrap InitializedHandler. The supervisor goroutine runs unconditionally
-	// (subscriptions are per-session by SDK contract, unlike the logger which
-	// is stdio-only because multi-session HTTP would race the shared logger).
-	var priorInit func(context.Context, *mcp.InitializedRequest)
-	if httpAddr == "" {
-		priorInit = func(initCtx context.Context, req *mcp.InitializedRequest) {
-			logger := slog.New(mcp.NewLoggingHandler(req.Session, &mcp.LoggingHandlerOptions{
-				LoggerName: "talos-mcp",
-			}))
-			h.SetLogger(logger)
-
-			// Forward version compatibility warning to the connected MCP client.
-			if cv, err := tc.GetClusterVersion(initCtx); err == nil && !cv.InSupportedRange() {
-				logger.Warn("cluster Talos version is outside the tested range; some features may not work correctly",
-					"version", cv.String(),
-					"min_supported", talosversion.MinSupported.String(),
-					"max_tested", talosversion.MaxTested.String(),
-				)
-			}
-		}
-	}
-	serverOpts.InitializedHandler = func(initCtx context.Context, req *mcp.InitializedRequest) {
-		if priorInit != nil {
-			priorInit(initCtx, req)
-		}
-		go subMgr.SuperviseSession(req.Session)
+		// A nil Capabilities makes the SDK advertise logging; the other capabilities are still inferred from the registrations.
+		Capabilities: &mcp.ServerCapabilities{},
+		// Fires only for initialize-based sessions; 2026-07-28 subscriptions end through the SDK's subscriptions/listen deferred unsubscribe.
+		InitializedHandler: func(_ context.Context, req *mcp.InitializedRequest) {
+			go subMgr.SuperviseSession(req.Session)
+		},
 	}
 
 	server := mcp.NewServer(&mcp.Implementation{
@@ -296,16 +322,14 @@ func main() {
 	}, serverOpts)
 
 	// BindServer must happen-before any session can issue resources/subscribe.
-	// Sessions start inside runServer below; binding here is sufficient.
+	// Sessions start only after newServer returns; binding here is sufficient.
 	subMgr.BindServer(server)
 
-	tools.Register(server, h, readOnly)
-	resources.Register(server, tc, allowedNodes)
-	prompts.Register(server, readOnly)
+	tools.Register(server, h, cfg.ReadOnly)
+	resources.Register(server, cfg.ResourceClient, h.AllowedNodes)
+	prompts.Register(server, cfg.ReadOnly)
 
-	if err := runServer(ctx, server, httpAddr, authToken, newHTTPTransportConfig(), tc.Ping); err != nil {
-		slog.Error("server stopped with error", "error", err)
-	}
+	return server, subMgr
 }
 
 // validateHTTPConfig returns an error if HTTP mode is requested without an auth token.
@@ -380,8 +404,8 @@ func buildHTTPMux(mcpHandler http.Handler, token string, hc httpTransportConfig,
 // the bind address (e.g. behind nginx/Caddy/Tailscale).
 //
 // Cross-origin protection is intentionally NOT set on this struct. go-sdk v1.6.0
-// deprecated the StreamableHTTPOptions.CrossOriginProtection field and v1.8.0 removes
-// it; the SDK directs callers to wrap the handler with the stdlib middleware instead.
+// deprecated the StreamableHTTPOptions.CrossOriginProtection field, which v1.8.0 still
+// carries; the SDK directs callers to wrap the handler with the stdlib middleware instead.
 // newProtectedMCPHandler applies that wrapper. The cross-origin layer is orthogonal
 // to DisableLocalhostProtection (cross-origin non-safe-method denial vs. DNS rebinding
 // at the Host-header layer).
@@ -398,8 +422,8 @@ func newStreamableHTTPOptions(logger *slog.Logger) *mcp.StreamableHTTPOptions {
 // buildMuxForTest) — the same drift class that motivated newStreamableHTTPOptions.
 // See PR #177 and issue #179 for the regression this guards against.
 //
-// The wrapper form replaces the deprecated StreamableHTTPOptions.CrossOriginProtection
-// field (go-sdk v1.6.0 deprecation; v1.8.0 removal). Source-compatible with v1.6.x.
+// The wrapper form replaces the StreamableHTTPOptions.CrossOriginProtection field,
+// which go-sdk v1.6.0 deprecated.
 func newProtectedMCPHandler(server *mcp.Server, logger *slog.Logger) http.Handler {
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(_ *http.Request) *mcp.Server {
 		return server
@@ -441,10 +465,6 @@ func runServer(ctx context.Context, server *mcp.Server, addr, token string, hc h
 	return nil
 }
 
-// splitNonEmpty splits s by sep and returns non-empty, trimmed tokens.
-// parseSubscriptionLimits parses the rate/burst knobs for the subscription
-// manager, applying defaults when the env vars are unset. Returns an error
-// when a value is present but unparseable.
 func parseSubscriptionLimits(rateStr, burstStr string) (time.Duration, int, error) {
 	rate := time.Second
 	if rateStr != "" {
@@ -471,7 +491,6 @@ func parseSubscriptionLimits(rateStr, burstStr string) (time.Duration, int, erro
 	return rate, burst, nil
 }
 
-// Returns nil when s is empty.
 func splitNonEmpty(s, sep string) []string {
 	if s == "" {
 		return nil

@@ -5,7 +5,9 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -102,6 +104,104 @@ func TestGetTextBodyForRequestError(t *testing.T) {
 	// Check the result
 	if !result.IsError {
 		t.Error("Expected an error result, got success")
+	}
+}
+
+// TestGetTextBodyForRequestMaxResponseSize tests that GetTextBodyForRequest enforces MCP_MAX_RESPONSE_SIZE
+func TestGetTextBodyForRequestMaxResponseSize(t *testing.T) {
+	testCases := []struct {
+		name            string
+		maxResponseSize string
+		status          int
+		bodySize        int
+		expectError     bool
+		expectErrorText []string
+		exactErrorText  string
+	}{
+		{
+			name:            "body below the limit",
+			maxResponseSize: "16",
+			status:          http.StatusOK,
+			bodySize:        15,
+		},
+		{
+			name:            "body of exactly the limit",
+			maxResponseSize: "16",
+			status:          http.StatusOK,
+			bodySize:        16,
+		},
+		{
+			name:            "body above the limit",
+			maxResponseSize: "16",
+			status:          http.StatusOK,
+			bodySize:        17,
+			expectError:     true,
+			expectErrorText: []string{"16 bytes", "MCP_MAX_RESPONSE_SIZE", "selector", "time range", "`limit`"},
+		},
+		{
+			name:            "limit disabled",
+			maxResponseSize: "0",
+			status:          http.StatusOK,
+			bodySize:        1 << 20,
+		},
+		{
+			name:            "error status above the limit",
+			maxResponseSize: "16",
+			status:          http.StatusBadRequest,
+			bodySize:        64,
+			expectError:     true,
+			exactErrorText:  "unexpected response status code 400: " + strings.Repeat("x", 17),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("VM_INSTANCE_ENTRYPOINT", "http://example.com")
+			t.Setenv("VM_INSTANCE_TYPE", "single")
+			t.Setenv("MCP_MAX_RESPONSE_SIZE", tc.maxResponseSize)
+			cfg, err := config.InitConfig()
+			if err != nil {
+				t.Fatalf("Failed to init config: %v", err)
+			}
+
+			body := strings.Repeat("x", tc.bodySize)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, body)
+			}))
+			defer srv.Close()
+
+			req, err := http.NewRequest(http.MethodGet, srv.URL, nil)
+			if err != nil {
+				t.Fatalf("Failed to create request: %v", err)
+			}
+
+			result := GetTextBodyForRequest(req, cfg)
+			if result.IsError != tc.expectError {
+				t.Fatalf("Expected IsError=%v, got %v: %+v", tc.expectError, result.IsError, result.Content)
+			}
+			if len(result.Content) == 0 {
+				t.Fatal("Expected content in result, got empty content")
+			}
+			textContent, ok := result.Content[0].(mcp.TextContent)
+			if !ok {
+				t.Fatal("Expected TextContent, got different content type")
+			}
+			if !tc.expectError {
+				if textContent.Text != body {
+					t.Errorf("Expected the full %d-byte body, got %d bytes", len(body), len(textContent.Text))
+				}
+				return
+			}
+			for _, want := range tc.expectErrorText {
+				if !strings.Contains(textContent.Text, want) {
+					t.Errorf("Expected error text to contain %q, got: %s", want, textContent.Text)
+				}
+			}
+			if tc.exactErrorText != "" && textContent.Text != tc.exactErrorText {
+				t.Errorf("Expected error text %q, got: %q", tc.exactErrorText, textContent.Text)
+			}
+		})
 	}
 }
 
@@ -249,7 +349,7 @@ func TestGetSelectURLWithDefaultTenant(t *testing.T) {
 		name            string
 		instanceType    string
 		defaultTenantID string
-		requestTenant   string
+		requestTenant   any
 		expectedURL     string
 	}{
 		{
@@ -288,6 +388,13 @@ func TestGetSelectURLWithDefaultTenant(t *testing.T) {
 			expectedURL:     "http://example.com/select/0/prometheus/api/v1/query",
 		},
 		{
+			name:            "Cluster mode with numeric request tenant",
+			instanceType:    "cluster",
+			defaultTenantID: "123",
+			requestTenant:   float64(456),
+			expectedURL:     "http://example.com/select/456/prometheus/api/v1/query",
+		},
+		{
 			name:            "Single mode ignores tenant",
 			instanceType:    "single",
 			defaultTenantID: "123",
@@ -309,7 +416,7 @@ func TestGetSelectURLWithDefaultTenant(t *testing.T) {
 			}
 
 			tcr := mcp.CallToolRequest{}
-			if tc.requestTenant != "" {
+			if tc.requestTenant != nil && tc.requestTenant != "" {
 				tcr.Params.Arguments = map[string]any{"tenant": tc.requestTenant}
 			}
 
@@ -320,6 +427,50 @@ func TestGetSelectURLWithDefaultTenant(t *testing.T) {
 
 			if url != tc.expectedURL {
 				t.Errorf("Expected URL %q, got %q", tc.expectedURL, url)
+			}
+		})
+	}
+}
+
+func TestGetToolReqTenantParam(t *testing.T) {
+	tests := []struct {
+		name          string
+		args          map[string]any
+		expectedValue string
+		expectError   bool
+	}{
+		{name: "string account", args: map[string]any{"tenant": "100"}, expectedValue: "100"},
+		{name: "string account and project", args: map[string]any{"tenant": "100:200"}, expectedValue: "100:200"},
+		{name: "numeric tenant", args: map[string]any{"tenant": float64(123)}, expectedValue: "123"},
+		{name: "numeric zero tenant", args: map[string]any{"tenant": float64(0)}, expectedValue: "0"},
+		{name: "large numeric tenant", args: map[string]any{"tenant": float64(421598)}, expectedValue: "421598"},
+		{name: "missing tenant", expectedValue: ""},
+		{name: "empty string tenant", args: map[string]any{"tenant": ""}, expectedValue: ""},
+		{name: "fractional numeric tenant", args: map[string]any{"tenant": 1.5}, expectError: true},
+		{name: "negative numeric tenant", args: map[string]any{"tenant": float64(-1)}, expectError: true},
+		{name: "numeric tenant out of range", args: map[string]any{"tenant": float64(1 << 33)}, expectError: true},
+		{name: "malformed string tenant", args: map[string]any{"tenant": "abc"}, expectError: true},
+		{name: "string tenant with too many parts", args: map[string]any{"tenant": "1:2:3"}, expectError: true},
+		{name: "invalid tenant type", args: map[string]any{"tenant": true}, expectError: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			tcr := mcp.CallToolRequest{}
+			tcr.Params.Arguments = test.args
+
+			value, err := GetToolReqTenantParam(tcr)
+			if test.expectError {
+				if err == nil {
+					t.Fatalf("Expected an error, got value %q", value)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Expected no error, got: %v", err)
+			}
+			if value != test.expectedValue {
+				t.Errorf("Expected %q, got %q", test.expectedValue, value)
 			}
 		})
 	}

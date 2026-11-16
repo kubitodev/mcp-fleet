@@ -4,12 +4,15 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
+	"strconv"
 	"sync"
 
 	"github.com/mark3labs/mcp-go/mcp"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	vmcloud "github.com/VictoriaMetrics/victoriametrics-cloud-api-go/v1"
 
 	"github.com/VictoriaMetrics/mcp-victoriametrics/cmd/mcp-victoriametrics/config"
@@ -232,7 +235,7 @@ func getSelectURL(ctx context.Context, cfg *config.Config, tcr mcp.CallToolReque
 	}
 
 	// Cluster mode
-	tenant, err := GetToolReqParam[string](tcr, "tenant", false)
+	tenant, err := GetToolReqTenantParam(tcr)
 	if err != nil {
 		return "", fmt.Errorf("failed to get tenant parameter: %v", err)
 	}
@@ -243,18 +246,27 @@ func getSelectURL(ctx context.Context, cfg *config.Config, tcr mcp.CallToolReque
 	return entrypointURL.JoinPath(append(args, path...)...).String(), nil
 }
 
-func GetTextBodyForRequest(req *http.Request, _ *config.Config, f ...func(s string) (string, error)) *mcp.CallToolResult {
+func GetTextBodyForRequest(req *http.Request, cfg *config.Config, f ...func(s string) (string, error)) *mcp.CallToolResult {
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to do request: %v", err))
 	}
-	body, err := io.ReadAll(resp.Body)
+	defer func() { _ = resp.Body.Close() }()
+	maxSize := cfg.MaxResponseSize()
+	var bodyReader io.Reader = resp.Body
+	if maxSize > 0 {
+		// Read one byte past the limit to tell a body of exactly maxSize bytes from a larger one.
+		bodyReader = io.LimitReader(resp.Body, maxSize+1)
+	}
+	body, err := io.ReadAll(bodyReader)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to read response body: %v", err))
 	}
-	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return mcp.NewToolResultError(fmt.Sprintf("unexpected response status code %v: %s", resp.StatusCode, string(body)))
+	}
+	if maxSize > 0 && int64(len(body)) > maxSize {
+		return mcp.NewToolResultError(fmt.Sprintf("response is larger than %d bytes (MCP_MAX_RESPONSE_SIZE); narrow the request with a more specific selector, a shorter time range or a `limit` argument where the tool has one", maxSize))
 	}
 	result := string(body)
 	for _, fn := range f {
@@ -263,6 +275,16 @@ func GetTextBodyForRequest(req *http.Request, _ *config.Config, f ...func(s stri
 		}
 	}
 	return mcp.NewToolResultText(result)
+}
+
+// withTenantParam adds the tenant parameter to the tool input schema.
+func withTenantParam(description string) mcp.ToolOption {
+	return mcp.WithString("tenant",
+		mcp.Title("Tenant name"),
+		mcp.Description(description),
+		mcp.DefaultString("0"),
+		mcp.Pattern(`^([0-9]+)(:[0-9]+)?$`),
+	)
 }
 
 type ToolReqParamType interface {
@@ -281,6 +303,34 @@ func GetToolReqParam[T ToolReqParamType](tcr mcp.CallToolRequest, param string, 
 		return value, fmt.Errorf("%s param is required", param)
 	}
 	return value, nil
+}
+
+// GetToolReqTenantParam returns the tenant parameter in the `accountID[:projectID]` form.
+// Some models pass the tenant as a number despite the string schema, so whole non-negative
+// numbers are accepted as well. An absent tenant results in an empty string.
+func GetToolReqTenantParam(tcr mcp.CallToolRequest) (string, error) {
+	var tenant string
+	switch v := tcr.GetArguments()["tenant"].(type) {
+	case nil:
+		return "", nil
+	case string:
+		tenant = v
+	case float64:
+		if v < 0 || v > math.MaxUint32 || v != math.Trunc(v) {
+			return "", fmt.Errorf("tenant must be a non-negative integer, got %v", v)
+		}
+		tenant = strconv.FormatUint(uint64(v), 10)
+	default:
+		return "", fmt.Errorf("tenant has wrong type: %T", v)
+	}
+	if tenant == "" {
+		return "", nil
+	}
+	token, err := auth.NewToken(tenant)
+	if err != nil {
+		return "", fmt.Errorf("invalid tenant %q, expected accountID or accountID:projectID: %v", tenant, err)
+	}
+	return token.String(), nil
 }
 
 func withCloudAccessKey(ctx context.Context, tcr mcp.CallToolRequest) context.Context {

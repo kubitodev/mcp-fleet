@@ -3,9 +3,6 @@ package tools
 import (
 	"context"
 	"fmt"
-	"io"
-	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/google/jsonschema-go/jsonschema"
@@ -15,18 +12,12 @@ import (
 	"github.com/Nosmoht/talos-mcp-server/internal/talos"
 )
 
-// etcdSnapshotResult is the structured output for talos_etcd_snapshot.
-type etcdSnapshotResult struct {
-	Path  string `json:"path"`
-	Bytes int64  `json:"bytes"`
-}
-
 // etcdOutputSchema is permissive: the handler returns one of two Talos
 // protobuf types (member list or status) depending on the subcommand, and
 // reflective derivation over protoimpl-embedded structs is noisy.
 var (
 	etcdOutputSchema         = permissiveObjectSchema()
-	etcdSnapshotOutputSchema = mustDeriveSchema[etcdSnapshotResult]()
+	etcdSnapshotOutputSchema = mustDeriveSchema[SecretFileResult]()
 )
 
 // EtcdOutputSchema returns the JSON schema for HandleEtcd.
@@ -46,27 +37,31 @@ func (h *Handlers) HandleEtcd(ctx context.Context, _ *mcp.CallToolRequest, args 
 	ctx, cancel := withToolTimeout(ctx)
 	defer cancel()
 
-	ctx, err := talos.WithNodes(ctx, args.Nodes, h.AllowedNodes)
+	targets, err := talos.CheckTargets(args.Nodes, h.AllowedNodes)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	switch args.Subcommand {
 	case "", "members":
-		resp, err := h.Client.EtcdMemberList(ctx, &machineapi.EtcdMemberListRequest{})
-		if err != nil {
+		rs, out := talos.FanOut(ctx, targets, func(c context.Context) (*machineapi.EtcdMemberListResponse, error) {
+			return h.Client.EtcdMemberList(c, &machineapi.EtcdMemberListRequest{})
+		})
+		if _, err := out.FailClosed(); err != nil {
 			return nil, nil, fmt.Errorf("etcd member list: %w", err)
 		}
 
-		return jsonResult(resp)
+		return unaryResult(rs)
 
 	case "status":
-		resp, err := h.Client.EtcdStatus(ctx)
-		if err != nil {
+		rs, out := talos.FanOut(ctx, targets, func(c context.Context) (*machineapi.EtcdStatusResponse, error) {
+			return h.Client.EtcdStatus(c)
+		})
+		if _, err := out.FailClosed(); err != nil {
 			return nil, nil, fmt.Errorf("etcd status: %w", err)
 		}
 
-		return jsonResult(resp)
+		return unaryResult(rs)
 
 	default:
 		return nil, nil, fmt.Errorf("unknown etcd subcommand %q: must be 'members' or 'status'", args.Subcommand)
@@ -81,29 +76,25 @@ const etcdSnapshotTimeout = 5 * time.Minute
 // EtcdSnapshotArgs defines input for talos_etcd_snapshot.
 type EtcdSnapshotArgs struct {
 	Nodes []string `json:"nodes" jsonschema:"Target control plane node (exactly one required). Etcd snapshots must be taken from a single control plane node."`
-	Path  string   `json:"path" jsonschema:"Absolute local file path to write the snapshot (e.g. /tmp/etcd-snapshot.db). The parent directory must exist."`
+	Path  string   `json:"path" jsonschema:"Absolute local file path to write the snapshot (e.g. /tmp/etcd-snapshot.db). The parent directory must exist. The file must not exist."`
 }
 
 // HandleEtcdSnapshot implements the talos_etcd_snapshot tool.
 func (h *Handlers) HandleEtcdSnapshot(ctx context.Context, req *mcp.CallToolRequest, args EtcdSnapshotArgs) (*mcp.CallToolResult, any, error) {
-	if args.Path == "" {
-		return nil, nil, fmt.Errorf("path must be specified")
-	}
-
-	if !filepath.IsAbs(args.Path) {
-		return nil, nil, fmt.Errorf("path must be absolute (got %q)", args.Path)
-	}
-
-	if cleaned := filepath.Clean(args.Path); cleaned != args.Path {
-		return nil, nil, fmt.Errorf("path must not contain .. or redundant separators (got %q)", args.Path)
+	if err := checkSecretFilePath(args.Path); err != nil {
+		return nil, nil, err
 	}
 
 	if len(args.Nodes) != 1 {
 		return nil, nil, fmt.Errorf("talos_etcd_snapshot requires exactly one target node (got %d); specify a single control plane node", len(args.Nodes))
 	}
 
-	ctx, err := talos.WithNodes(ctx, args.Nodes, h.AllowedNodes)
+	ctx, err := talos.WithSingleNode(ctx, args.Nodes, h.AllowedNodes)
 	if err != nil {
+		return nil, nil, err
+	}
+
+	if err := checkSecretFileAbsent(args.Path); err != nil {
 		return nil, nil, err
 	}
 
@@ -120,27 +111,12 @@ func (h *Handlers) HandleEtcdSnapshot(ctx context.Context, req *mcp.CallToolRequ
 
 	notifyProgress(ctx, req, "Streaming snapshot to disk", 2, 3)
 
-	f, err := os.Create(args.Path)
+	res, err := WriteSecretFile(args.Path, rc)
 	if err != nil {
-		return nil, nil, fmt.Errorf("create snapshot file: %w", err)
-	}
-	defer f.Close() //nolint:errcheck // cleanup-only; error handled by explicit Close below
-
-	n, err := io.Copy(f, rc)
-	if err != nil {
-		os.Remove(args.Path) //nolint:errcheck,gosec // best-effort cleanup of partial file
-		return nil, nil, fmt.Errorf("stream snapshot: %w", err)
-	}
-
-	if err := f.Sync(); err != nil {
-		return nil, nil, fmt.Errorf("sync snapshot file: %w", err)
-	}
-
-	if err := f.Close(); err != nil {
-		return nil, nil, fmt.Errorf("close snapshot file: %w", err)
+		return nil, nil, fmt.Errorf("write snapshot: %w", err)
 	}
 
 	notifyProgress(ctx, req, "Snapshot complete", 3, 3)
 
-	return jsonResult(etcdSnapshotResult{Path: args.Path, Bytes: n})
+	return jsonResult(res)
 }

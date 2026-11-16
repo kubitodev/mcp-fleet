@@ -8,19 +8,17 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	talosclient "github.com/siderolabs/talos/pkg/machinery/client"
 
 	"github.com/Nosmoht/talos-mcp-server/internal/talos"
 )
 
 // Handlers holds the Talos client and exposes MCP tool handler methods.
 type Handlers struct {
-	Client           talos.ClientInterface
+	Client           Client
 	AllowedNodes     *talos.NodeAllowlist
 	AllowedPaths     []string // set once at startup; read-only afterward
 	SkipVersionCheck bool     // set once at startup; read-only afterward
@@ -41,39 +39,46 @@ type Handlers struct {
 	// that talos_meta is allowed to write or delete. Empty means only the
 	// reserved keys are writable. Set once at startup.
 	MetaPrivilegedKeys map[uint8]struct{}
-	// patchMu serialises concurrent HandlePatchConfig calls on a per-node basis.
-	// In HTTP multi-session mode two agents could otherwise both fetch the current
-	// config, each merge their own patch, and the second apply would silently
-	// overwrite the first (read-modify-write race). The map is populated lazily
-	// on first use and is bounded by the number of distinct patch targets.
-	patchMu sync.Map // map[string]*sync.Mutex
-	// logger is the active slog.Logger for MCP log notifications.
-	// It is swapped atomically per session in stdio mode.
-	logger atomic.Pointer[slog.Logger]
+	// configWriteMu is process-wide because node spellings (default, hostname, IP) share no key without DNS.
+	configWriteMu sync.Mutex
+	// insecureApplyLocks holds the per-endpoint maintenance-mode apply locks; authenticated writes use configWriteMu.
+	insecureApplyLocks sync.Map
+	// dialMaintenance replaces dialTalosMaintenance in tests; nil selects it.
+	// Unexported so the TLS/fingerprint dial cannot be swapped from outside the package.
+	dialMaintenance func(ctx context.Context, endpoint string, fingerprint []byte) (maintenanceClient, error)
 }
 
-// nodePatchMu returns (or lazily creates) the per-node mutex that serialises
-// concurrent config-patch operations. key is the resolved node identifier or
-// "<default>" when no explicit node was provided.
-func (h *Handlers) nodePatchMu(key string) *sync.Mutex {
-	mu, _ := h.patchMu.LoadOrStore(key, &sync.Mutex{})
+// insecureApplyMu returns the apply lock for an endpoint; the key must come from talos.CanonicalIP, see .claude/rules/insecure-mode.md.
+func (h *Handlers) insecureApplyMu(canonicalEndpoint string) *sync.Mutex {
+	mu, _ := h.insecureApplyLocks.LoadOrStore(canonicalEndpoint, &sync.Mutex{})
 	return mu.(*sync.Mutex) //nolint:forcetypeassert // only *sync.Mutex is ever stored
 }
 
-// SetLogger replaces the active logger used for MCP log notifications.
-// In stdio mode this is called once per session from InitializedHandler.
-func (h *Handlers) SetLogger(l *slog.Logger) {
-	h.logger.Store(l)
+func (h *Handlers) lockConfigWrite(ctx context.Context, tool string) (context.Context, func(), error) {
+	// TryLock, not Lock: a waiting call would hold a TALOS_MCP_MAX_CONCURRENT slot.
+	if !h.configWriteMu.TryLock() {
+		err := fmt.Errorf("%s refused: config write in progress on this server; retry when it completes", tool)
+		slog.Default().Warn("tool refused", "tool", tool, "error", err)
+		return ctx, nil, err
+	}
+	ctx, cancel := withToolTimeout(ctx)
+	return ctx, func() {
+		cancel()
+		h.configWriteMu.Unlock()
+	}, nil
 }
 
-// defaultToolTimeout is the maximum time a read-only tool call may take before
-// being cancelled. This prevents indefinite hangs when a Talos node is
-// unresponsive. Tools with their own timeout logic (HandleHealth, HandleEvents)
-// do not use this.
+func configWriteError(ctx context.Context, tool string, dryRun bool, err error) (unknown bool, wrapped error) {
+	// The node keeps writing after the client gives up, so a timed-out apply may have landed.
+	if ctx.Err() != nil && !dryRun {
+		return true, fmt.Errorf("%s: outcome unknown, the node may have applied the config; check it with talos_get machineconfig before retrying: %w", tool, err)
+	}
+	return false, fmt.Errorf("apply configuration: %w", err)
+}
+
+// defaultToolTimeout bounds read tools and the locked config-write section so an unresponsive node cannot hang them.
 const defaultToolTimeout = 30 * time.Second
 
-// withToolTimeout returns a context with defaultToolTimeout applied.
-// The caller must defer cancel().
 func withToolTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(ctx, defaultToolTimeout)
 }
@@ -132,10 +137,8 @@ func permissiveObjectSchema() *jsonschema.Schema {
 	}
 }
 
-// auditLog emits a structured audit record at INFO level.
-// Always writes to the server-side log; additionally forwards to the MCP
-// client via notifications/message when a session logger is installed.
-// MCP delivery is best-effort — errors are silently dropped per slog contract.
+// auditLog emits a structured audit record at INFO level to the server's
+// stderr slog log. It sends nothing to the MCP client.
 func (h *Handlers) auditLog(tool string, args any, nodes []string) {
 	argsJSON, err := json.Marshal(args)
 	if err != nil {
@@ -152,37 +155,19 @@ func (h *Handlers) auditLog(tool string, args any, nodes []string) {
 		"nodes", nodeList,
 		"args", string(argsJSON),
 	)
-
-	if l := h.logger.Load(); l != nil {
-		l.Info("tool invoked",
-			"tool", tool,
-			"nodes", nodeList,
-			"args", string(argsJSON),
-		)
-	}
 }
 
-// mcpLogError forwards an operational error to the MCP client at ERROR level.
-// Only called after guard checks pass (not for validation errors).
-// Best-effort — silently dropped if no logger is set or delivery fails.
+// mcpLogError writes an operational error to the server's stderr slog log at
+// ERROR level. Only called after guard checks pass (not for validation errors).
 func (h *Handlers) mcpLogError(tool string, err error) {
 	slog.Default().Error("tool error", "tool", tool, "error", err)
-
-	if l := h.logger.Load(); l != nil {
-		l.Error("tool error", "tool", tool, "error", err.Error())
-	}
 }
 
-// mcpLogWarn forwards a warning to the MCP client at WARN level.
+// mcpLogWarn writes a warning to the server's stderr slog log at WARN level.
 // Takes an explicit msg parameter (unlike mcpLogError) because warnings
 // carry additional context alongside the underlying error.
-// Best-effort — silently dropped if no logger is set or delivery fails.
 func (h *Handlers) mcpLogWarn(tool string, msg string, err error) {
 	slog.Default().Warn("tool warning", "tool", tool, "msg", msg, "error", err)
-
-	if l := h.logger.Load(); l != nil {
-		l.Warn(msg, "tool", tool, "error", err.Error())
-	}
 }
 
 // resolveDryRun returns true (dry-run mode) unless v is explicitly set to false.
@@ -204,10 +189,7 @@ func resolveGraceful(v *bool) bool {
 	return v == nil || *v
 }
 
-// Outcome values for auditOutcome — every insecure-mode handler exit path
-// records exactly one of these strings, paired with the auditLog entry that
-// was emitted at handler entry. Defenders can join (audit-line, outcome-line)
-// by tool + nodes + a per-call correlation field.
+// Outcome* values are the outcome field of an AUDIT_OUTCOME record.
 const (
 	OutcomeOK                     = "ok"
 	OutcomeRefusedEnable          = "refused:enable-insecure-unset"
@@ -222,16 +204,11 @@ const (
 	OutcomeDialError              = "dial-error"
 	OutcomeRPCError               = "rpc-error"
 	OutcomeRefusedArgs            = "refused:args-invalid"
+	OutcomeRefusedWriteBusy       = "refused:config-write-in-progress"
+	OutcomeUnknown                = "outcome-unknown"
 )
 
-// auditOutcome emits a paired log line for every auditLog call, recording
-// the final outcome (success, refused-at-gate, dial-error, rpc-error) so an
-// IR responder can distinguish reconnaissance from action. Callers use:
-//
-//	defer func() { h.auditOutcome("talos_apply_config", outcome, returnErr) }()
-//
-// outcome is set by the handler to one of the Outcome* constants above
-// before each return.
+// auditOutcome logs a handler's outcome with its tool and error but no per-call key.
 func (h *Handlers) auditOutcome(tool, outcome string, err error) {
 	errStr := ""
 	if err != nil {
@@ -242,24 +219,8 @@ func (h *Handlers) auditOutcome(tool, outcome string, err error) {
 		"outcome", outcome,
 		"error", errStr,
 	)
-	if l := h.logger.Load(); l != nil {
-		l.Info("tool outcome",
-			"tool", tool,
-			"outcome", outcome,
-			"error", errStr,
-		)
-	}
 }
 
-// canonicalizeAndCheckInsecure validates the common gating for any
-// maintenance-mode tool call. It returns the canonical endpoint string used
-// uniformly for allowlist match, lock-key derivation, and gRPC dial; the
-// decoded fingerprint bytes (nil when no fingerprint was supplied); and the
-// outcome code identifying which gate failed (empty when all gates pass).
-//
-// The validation order is deliberate: consistency checks before format checks
-// (so an LLM that sets cert_fingerprint without insecure=true gets the
-// semantically-correct error, not a hex-format error).
 func (h *Handlers) canonicalizeAndCheckInsecure(endpoint, certFingerprint string, nodesProvided bool) (canonicalEndpoint string, fp []byte, outcome string, err error) {
 	if !h.EnableInsecure {
 		return "", nil, OutcomeRefusedEnable, fmt.Errorf("insecure mode refused: TALOS_MCP_ENABLE_INSECURE must be set to true at server startup")
@@ -289,6 +250,13 @@ func (h *Handlers) canonicalizeAndCheckInsecure(endpoint, certFingerprint string
 	return canon, fp, "", nil
 }
 
+func fingerprintRequiresInsecure(tool, certFingerprint string, insecure bool) error {
+	if certFingerprint != "" && !insecure {
+		return fmt.Errorf("%s refused: cert_fingerprint requires insecure=true", tool)
+	}
+	return nil
+}
+
 // dialInsecure builds a one-shot maintenance-mode client. Errors are returned
 // to the caller verbatim; the caller is responsible for emitting auditOutcome
 // with OutcomeDialError on failure.
@@ -296,8 +264,25 @@ func (h *Handlers) canonicalizeAndCheckInsecure(endpoint, certFingerprint string
 // The caller MUST Close() the returned client when done — the per-call factory
 // shape is intentional. Maintenance-mode endpoints are short-lived and each
 // call targets a different fresh node IP, so a shared pool would buy nothing.
-func (h *Handlers) dialInsecure(ctx context.Context, canonicalEndpoint string, fp []byte) (*talosclient.Client, error) {
-	return talos.NewInsecureClient(ctx, canonicalEndpoint, fp)
+func (h *Handlers) dialInsecure(ctx context.Context, canonicalEndpoint string, fp []byte) (maintenanceClient, error) {
+	return h.maintenanceDialer()(ctx, canonicalEndpoint, fp)
+}
+
+func (h *Handlers) maintenanceDialer() func(ctx context.Context, endpoint string, fingerprint []byte) (maintenanceClient, error) {
+	if h.dialMaintenance != nil {
+		return h.dialMaintenance
+	}
+	return dialTalosMaintenance
+}
+
+// dialTalosMaintenance returns an untyped nil on error: a nil *talos.Client
+// wrapped in maintenanceClient compares non-nil.
+func dialTalosMaintenance(ctx context.Context, endpoint string, fingerprint []byte) (maintenanceClient, error) {
+	c, err := talos.NewInsecureClient(ctx, endpoint, fingerprint)
+	if err != nil {
+		return nil, err
+	}
+	return c, nil
 }
 
 // notifyProgress sends a progress notification to the client if the request

@@ -7,6 +7,85 @@ import (
 	"time"
 )
 
+func TestInitConfigMaxResponseSize(t *testing.T) {
+	testCases := []struct {
+		name          string
+		value         string
+		expectedValue int64
+		expectedError string
+	}{
+		{
+			name:          "default",
+			value:         "",
+			expectedValue: 16 * 1024 * 1024,
+		},
+		{
+			name:          "custom size",
+			value:         "1048576",
+			expectedValue: 1048576,
+		},
+		{
+			name:          "disabled",
+			value:         "0",
+			expectedValue: 0,
+		},
+		{
+			name:          "negative",
+			value:         "-1",
+			expectedError: "MCP_MAX_RESPONSE_SIZE must be non-negative",
+		},
+		{
+			name:          "not a number",
+			value:         "16MiB",
+			expectedError: "failed to parse MCP_MAX_RESPONSE_SIZE: strconv.ParseInt: parsing \"16MiB\": invalid syntax",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("VM_INSTANCE_ENTRYPOINT", "http://example.com")
+			t.Setenv("VM_INSTANCE_TYPE", "single")
+			t.Setenv("MCP_MAX_RESPONSE_SIZE", tc.value)
+			cfg, err := InitConfig()
+			if tc.expectedError != "" {
+				if err == nil || err.Error() != tc.expectedError {
+					t.Fatalf("Expected error %q, got: %v", tc.expectedError, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Expected no error, got: %v", err)
+			}
+			if cfg.MaxResponseSize() != tc.expectedValue {
+				t.Errorf("Expected max response size %d, got: %d", tc.expectedValue, cfg.MaxResponseSize())
+			}
+		})
+	}
+}
+
+func TestInitConfigInstructionsOverride(t *testing.T) {
+	t.Setenv("VM_INSTANCE_ENTRYPOINT", "http://example.com")
+	t.Setenv("VM_INSTANCE_TYPE", "single")
+
+	t.Setenv("MCP_INSTRUCTIONS_OVERRIDE", "")
+	cfg, err := InitConfig()
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+	if cfg.InstructionsOverride() != "" {
+		t.Errorf("Expected empty instructions override, got: %q", cfg.InstructionsOverride())
+	}
+
+	t.Setenv("MCP_INSTRUCTIONS_OVERRIDE", "  This instance stores production metrics.\n")
+	cfg, err = InitConfig()
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+	if expected := "This instance stores production metrics."; cfg.InstructionsOverride() != expected {
+		t.Errorf("Expected instructions override %q, got: %q", expected, cfg.InstructionsOverride())
+	}
+}
+
 func TestInitConfig(t *testing.T) {
 	// Save original environment variables
 	originalEntrypoint := os.Getenv("VM_INSTANCE_ENTRYPOINT")
@@ -17,6 +96,8 @@ func TestInitConfig(t *testing.T) {
 	originalHeartbeatInterval := os.Getenv("MCP_HEARTBEAT_INTERVAL")
 	originalHeaders := os.Getenv("VM_INSTANCE_HEADERS")
 	originalPassthroughHeaders := os.Getenv("MCP_PASSTHROUGH_HEADERS")
+	originalStateless := os.Getenv("MCP_STATELESS")
+	originalDisableLocalhostProtection := os.Getenv("MCP_DISABLE_LOCALHOST_PROTECTION")
 
 	// Restore environment variables after test
 	defer func() {
@@ -28,6 +109,8 @@ func TestInitConfig(t *testing.T) {
 		os.Setenv("MCP_HEARTBEAT_INTERVAL", originalHeartbeatInterval)
 		os.Setenv("VM_INSTANCE_HEADERS", originalHeaders)
 		os.Setenv("MCP_PASSTHROUGH_HEADERS", originalPassthroughHeaders)
+		os.Setenv("MCP_STATELESS", originalStateless)
+		os.Setenv("MCP_DISABLE_LOCALHOST_PROTECTION", originalDisableLocalhostProtection)
 	}()
 
 	// Test case 1: Valid configuration
@@ -404,5 +487,114 @@ func TestInitConfig(t *testing.T) {
 				t.Errorf("Expected header %q at index %d, got %q", expected[i], i, h)
 			}
 		}
+	})
+
+	// Test case: Stateless defaults to false
+	t.Run("Stateless default", func(t *testing.T) {
+		os.Setenv("VM_INSTANCE_ENTRYPOINT", "http://example.com")
+		os.Setenv("VM_INSTANCE_TYPE", "single")
+		os.Setenv("MCP_STATELESS", "")
+
+		cfg, err := InitConfig()
+		if err != nil {
+			t.Fatalf("Expected no error, got: %v", err)
+		}
+		if cfg.Stateless() {
+			t.Error("Expected Stateless() to default to false")
+		}
+	})
+
+	// Test case: Stateless enabled
+	t.Run("Stateless enabled", func(t *testing.T) {
+		os.Setenv("VM_INSTANCE_ENTRYPOINT", "http://example.com")
+		os.Setenv("VM_INSTANCE_TYPE", "single")
+		os.Setenv("MCP_STATELESS", "true")
+
+		cfg, err := InitConfig()
+		if err != nil {
+			t.Fatalf("Expected no error, got: %v", err)
+		}
+		if !cfg.Stateless() {
+			t.Error("Expected Stateless() to be true when MCP_STATELESS=true")
+		}
+
+		os.Setenv("MCP_STATELESS", "")
+	})
+
+	// Test case: Stateless explicitly false
+	t.Run("Stateless explicit false", func(t *testing.T) {
+		os.Setenv("VM_INSTANCE_ENTRYPOINT", "http://example.com")
+		os.Setenv("VM_INSTANCE_TYPE", "single")
+		os.Setenv("MCP_STATELESS", "false")
+
+		cfg, err := InitConfig()
+		if err != nil {
+			t.Fatalf("Expected no error, got: %v", err)
+		}
+		if cfg.Stateless() {
+			t.Error("Expected Stateless() to be false when MCP_STATELESS=false")
+		}
+
+		os.Setenv("MCP_STATELESS", "")
+	})
+
+	// Test case: Invalid stateless value
+	t.Run("Invalid stateless value", func(t *testing.T) {
+		os.Setenv("VM_INSTANCE_ENTRYPOINT", "http://example.com")
+		os.Setenv("VM_INSTANCE_TYPE", "single")
+		os.Setenv("MCP_STATELESS", "notabool")
+
+		_, err := InitConfig()
+		if err == nil {
+			t.Fatal("Expected error for invalid MCP_STATELESS, got nil")
+		}
+
+		os.Setenv("MCP_STATELESS", "")
+	})
+
+	// Test case: DisableLocalhostProtection defaults to false
+	t.Run("DisableLocalhostProtection default", func(t *testing.T) {
+		os.Setenv("VM_INSTANCE_ENTRYPOINT", "http://example.com")
+		os.Setenv("VM_INSTANCE_TYPE", "single")
+		os.Setenv("MCP_DISABLE_LOCALHOST_PROTECTION", "")
+
+		cfg, err := InitConfig()
+		if err != nil {
+			t.Fatalf("Expected no error, got: %v", err)
+		}
+		if cfg.DisableLocalhostProtection() {
+			t.Error("Expected DisableLocalhostProtection() to default to false")
+		}
+	})
+
+	// Test case: DisableLocalhostProtection enabled
+	t.Run("DisableLocalhostProtection enabled", func(t *testing.T) {
+		os.Setenv("VM_INSTANCE_ENTRYPOINT", "http://example.com")
+		os.Setenv("VM_INSTANCE_TYPE", "single")
+		os.Setenv("MCP_DISABLE_LOCALHOST_PROTECTION", "true")
+
+		cfg, err := InitConfig()
+		if err != nil {
+			t.Fatalf("Expected no error, got: %v", err)
+		}
+		if !cfg.DisableLocalhostProtection() {
+			t.Error("Expected DisableLocalhostProtection() to be true when MCP_DISABLE_LOCALHOST_PROTECTION=true")
+		}
+
+		os.Setenv("MCP_DISABLE_LOCALHOST_PROTECTION", "")
+	})
+
+	// Test case: Invalid DisableLocalhostProtection value
+	t.Run("Invalid DisableLocalhostProtection value", func(t *testing.T) {
+		os.Setenv("VM_INSTANCE_ENTRYPOINT", "http://example.com")
+		os.Setenv("VM_INSTANCE_TYPE", "single")
+		os.Setenv("MCP_DISABLE_LOCALHOST_PROTECTION", "notabool")
+
+		_, err := InitConfig()
+		if err == nil {
+			t.Fatal("Expected error for invalid MCP_DISABLE_LOCALHOST_PROTECTION, got nil")
+		}
+
+		os.Setenv("MCP_DISABLE_LOCALHOST_PROTECTION", "")
 	})
 }

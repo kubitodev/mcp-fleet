@@ -101,41 +101,6 @@ func TestExtractFromImage(t *testing.T) {
 	}
 }
 
-func TestValidateUpgradePath(t *testing.T) {
-	v := func(major, minor, patch int) version.TalosVersion {
-		return version.TalosVersion{Major: major, Minor: minor, Patch: patch}
-	}
-
-	tests := []struct {
-		name    string
-		current version.TalosVersion
-		target  version.TalosVersion
-		wantErr bool
-	}{
-		{name: "patch upgrade", current: v(1, 12, 0), target: v(1, 12, 6), wantErr: false},
-		{name: "minor upgrade +1", current: v(1, 11, 5), target: v(1, 12, 0), wantErr: false},
-		{name: "minor upgrade skip +2", current: v(1, 10, 0), target: v(1, 12, 0), wantErr: true},
-		{name: "minor upgrade skip +3", current: v(1, 9, 0), target: v(1, 12, 0), wantErr: true},
-		{name: "downgrade patch", current: v(1, 12, 6), target: v(1, 12, 0), wantErr: true},
-		{name: "downgrade minor", current: v(1, 12, 0), target: v(1, 11, 9), wantErr: true},
-		{name: "same version", current: v(1, 12, 6), target: v(1, 12, 6), wantErr: true},
-		{name: "cross-major upgrade", current: v(1, 12, 6), target: v(2, 0, 0), wantErr: true},
-		{name: "cross-major downgrade", current: v(2, 0, 0), target: v(1, 12, 6), wantErr: true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := version.ValidateUpgradePath(tt.current, tt.target)
-			if tt.wantErr && err == nil {
-				t.Fatalf("ValidateUpgradePath(%s→%s) = nil, want error", tt.current, tt.target)
-			}
-			if !tt.wantErr && err != nil {
-				t.Fatalf("ValidateUpgradePath(%s→%s) error = %v", tt.current, tt.target, err)
-			}
-		})
-	}
-}
-
 func TestInSupportedRange(t *testing.T) {
 	v := func(major, minor, patch int) version.TalosVersion {
 		return version.TalosVersion{Major: major, Minor: minor, Patch: patch}
@@ -150,9 +115,10 @@ func TestInSupportedRange(t *testing.T) {
 		{name: "at min", v: v(1, 9, 0), want: true},
 		{name: "in range", v: v(1, 11, 3), want: true},
 		{name: "in range upper", v: v(1, 12, 6), want: true},
-		{name: "at max patch 0", v: v(1, 13, 0), want: true},
-		{name: "at max patch 255", v: v(1, 13, 255), want: true},
-		{name: "above max minor", v: v(1, 14, 0), want: false},
+		{name: "previous minor", v: v(1, 13, 0), want: true},
+		{name: "at max patch 0", v: v(1, 14, 0), want: true},
+		{name: "at max patch 255", v: v(1, 14, 255), want: true},
+		{name: "above max minor", v: v(1, 15, 0), want: false},
 		{name: "above max major", v: v(2, 0, 0), want: false},
 	}
 

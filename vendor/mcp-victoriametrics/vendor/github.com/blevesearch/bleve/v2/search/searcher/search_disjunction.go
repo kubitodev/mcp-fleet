@@ -68,8 +68,14 @@ func newDisjunctionSearcher(ctx context.Context, indexReader index.IndexReader,
 			optionsDisjunctionOptimizable(options) {
 			rv, err := optimizeCompositeSearcher(ctx, "disjunction:unadorned",
 				indexReader, qsearchers, options)
-			if err != nil || rv != nil {
-				return rv, err
+			if err != nil {
+				return nil, err
+			}
+			if rv != nil {
+				for _, s := range qsearchers {
+					_ = s.Close()
+				}
+				return rv, nil
 			}
 		}
 	}
@@ -114,8 +120,13 @@ func optimizeCompositeSearcher(ctx context.Context, optimizationKind string,
 		return nil, nil
 	}
 
-	return newTermSearcherFromReader(ctx, indexReader, tfr,
+	termSearcher, err := newTermSearcherFromReader(ctx, indexReader, tfr,
 		[]byte(optimizationKind), "*", 1.0, options)
+	if err != nil || termSearcher == nil {
+		return nil, err
+	}
+
+	return termSearcher, err
 }
 
 func tooManyClauses(count int) bool {

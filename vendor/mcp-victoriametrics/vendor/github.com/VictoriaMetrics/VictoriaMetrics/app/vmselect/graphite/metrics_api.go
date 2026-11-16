@@ -1,7 +1,7 @@
 package graphite
 
 import (
-	"flag"
+	"context"
 	"fmt"
 	"math"
 	"net/http"
@@ -21,13 +21,10 @@ import (
 	"github.com/VictoriaMetrics/metricsql"
 )
 
-var maxTagValueSuffixes = flag.Int("search.maxTagValueSuffixesPerSearch", 100e3, "The maximum number of tag value suffixes returned from /metrics/find")
-
 // MetricsFindHandler implements /metrics/find handler.
 //
 // See https://graphite-api.readthedocs.io/en/latest/api.html#metrics-find
 func MetricsFindHandler(startTime time.Time, w http.ResponseWriter, r *http.Request) error {
-	deadline := searchutil.GetDeadlineForQuery(r, startTime)
 	format := r.FormValue("format")
 	if format == "" {
 		format = "treejson"
@@ -79,7 +76,10 @@ func MetricsFindHandler(startTime time.Time, w http.ResponseWriter, r *http.Requ
 		MinTimestamp: from,
 		MaxTimestamp: until,
 	}
-	paths, err := metricsFind(tr, label, "", query, delimiter[0], false, deadline)
+	ctx, cancel := searchutil.GetContextForQuery(r, startTime)
+	defer cancel()
+
+	paths, err := metricsFind(ctx, tr, label, "", query, delimiter[0], false)
 	if err != nil {
 		return err
 	}
@@ -121,7 +121,6 @@ func deduplicatePaths(paths []string) []string {
 //
 // See https://graphite-api.readthedocs.io/en/latest/api.html#metrics-expand
 func MetricsExpandHandler(startTime time.Time, w http.ResponseWriter, r *http.Request) error {
-	deadline := searchutil.GetDeadlineForQuery(r, startTime)
 	queries := r.Form["query"]
 	if len(queries) == 0 {
 		return fmt.Errorf("missing `query` arg")
@@ -153,9 +152,12 @@ func MetricsExpandHandler(startTime time.Time, w http.ResponseWriter, r *http.Re
 		MinTimestamp: from,
 		MaxTimestamp: until,
 	}
+	ctx, cancel := searchutil.GetContextForQuery(r, startTime)
+	defer cancel()
+
 	m := make(map[string][]string, len(queries))
 	for _, query := range queries {
-		paths, err := metricsFind(tr, label, "", query, delimiter[0], true, deadline)
+		paths, err := metricsFind(ctx, tr, label, "", query, delimiter[0], true)
 		if err != nil {
 			return err
 		}
@@ -201,10 +203,12 @@ func MetricsExpandHandler(startTime time.Time, w http.ResponseWriter, r *http.Re
 //
 // See https://graphite-api.readthedocs.io/en/latest/api.html#metrics-index-json
 func MetricsIndexHandler(startTime time.Time, w http.ResponseWriter, r *http.Request) error {
-	deadline := searchutil.GetDeadlineForQuery(r, startTime)
+	ctx, cancel := searchutil.GetContextForQuery(r, startTime)
+	defer cancel()
+
 	jsonp := r.FormValue("jsonp")
 	sq := storage.NewSearchQuery(0, math.MaxInt64, nil, 0)
-	metricNames, err := netstorage.LabelValues(nil, "__name__", sq, 0, deadline)
+	metricNames, err := netstorage.LabelValues(ctx, nil, "__name__", sq, 0)
 	if err != nil {
 		return fmt.Errorf(`cannot obtain metric names: %w`, err)
 	}
@@ -221,11 +225,12 @@ func MetricsIndexHandler(startTime time.Time, w http.ResponseWriter, r *http.Req
 }
 
 // metricsFind searches for label values that match the given qHead and qTail.
-func metricsFind(tr storage.TimeRange, label, qHead, qTail string, delimiter byte, isExpand bool, deadline searchutil.Deadline) ([]string, error) {
+func metricsFind(ctx context.Context, tr storage.TimeRange, label, qHead, qTail string, delimiter byte, isExpand bool) ([]string, error) {
+	maxSuffixes := 0 // let vmstorage use its maxTagValueSuffixesPerSearch limit
 	n := strings.IndexAny(qTail, "*{[")
 	if n < 0 {
 		query := qHead + qTail
-		suffixes, err := netstorage.TagValueSuffixes(nil, tr, label, query, delimiter, *maxTagValueSuffixes, deadline)
+		suffixes, err := netstorage.TagValueSuffixes(ctx, nil, tr, label, query, delimiter, maxSuffixes)
 		if err != nil {
 			return nil, err
 		}
@@ -245,7 +250,7 @@ func metricsFind(tr storage.TimeRange, label, qHead, qTail string, delimiter byt
 	}
 	if n == len(qTail)-1 && strings.HasSuffix(qTail, "*") {
 		query := qHead + qTail[:len(qTail)-1]
-		suffixes, err := netstorage.TagValueSuffixes(nil, tr, label, query, delimiter, *maxTagValueSuffixes, deadline)
+		suffixes, err := netstorage.TagValueSuffixes(ctx, nil, tr, label, query, delimiter, maxSuffixes)
 		if err != nil {
 			return nil, err
 		}
@@ -259,7 +264,7 @@ func metricsFind(tr storage.TimeRange, label, qHead, qTail string, delimiter byt
 		return results, nil
 	}
 	qHead += qTail[:n]
-	paths, err := metricsFind(tr, label, qHead, "*", delimiter, isExpand, deadline)
+	paths, err := metricsFind(ctx, tr, label, qHead, "*", delimiter, isExpand)
 	if err != nil {
 		return nil, err
 	}
@@ -283,7 +288,7 @@ func metricsFind(tr storage.TimeRange, label, qHead, qTail string, delimiter byt
 			results = append(results, path)
 			continue
 		}
-		fullPaths, err := metricsFind(tr, label, path, qTail, delimiter, isExpand, deadline)
+		fullPaths, err := metricsFind(ctx, tr, label, path, qTail, delimiter, isExpand)
 		if err != nil {
 			return nil, err
 		}

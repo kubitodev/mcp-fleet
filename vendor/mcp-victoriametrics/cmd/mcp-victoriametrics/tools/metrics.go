@@ -35,12 +35,7 @@ func toolMetrics(c *config.Config) mcp.Tool {
 	if c.IsCluster() || c.IsCloud() {
 		options = append(
 			options,
-			mcp.WithString("tenant",
-				mcp.Title("Tenant name"),
-				mcp.Description("Name of the tenant for which the list of metrics will be displayed"),
-				mcp.DefaultString("0"),
-				mcp.Pattern(`^([0-9]+)(:[0-9]+)?$`),
-			),
+			withTenantParam("Name of the tenant for which the list of metrics will be displayed"),
 		)
 	}
 	options = append(
@@ -96,7 +91,7 @@ func toolMetricsHandler(ctx context.Context, cfg *config.Config, tcr mcp.CallToo
 	return getLabelValues(ctx, cfg, tcr, "__name__", match, start, end, limit)
 }
 
-func RegisterToolMetrics(s *server.MCPServer, c *config.Config) {
+func registerToolMetrics(s *server.MCPServer, c *config.Config) {
 	if c.IsToolDisabled(toolNameMetrics) {
 		return
 	}

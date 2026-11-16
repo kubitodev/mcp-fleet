@@ -14,22 +14,28 @@ import (
 
 const (
 	toolsDisabledByDefault = "export,flags,metric_relabel_debug,downsampling_filters_debug,retention_filters_debug,test_rules"
+	defaultMaxResponseSize = 16 * 1024 * 1024
 )
 
 type Config struct {
-	serverMode         string
-	listenAddr         string
-	entrypoint         string
-	instanceType       string
-	bearerToken        string
-	disabledTools      map[string]bool
-	apiKey             string
-	apiBaseURL         string
-	heartbeatInterval  time.Duration
-	disableResources   bool
-	customHeaders      map[string]string
-	passthroughHeaders []string
-	defaultTenantID    string
+	serverMode                 string
+	listenAddr                 string
+	entrypoint                 string
+	instanceType               string
+	bearerToken                string
+	disabledTools              map[string]bool
+	apiKey                     string
+	apiBaseURL                 string
+	heartbeatInterval          time.Duration
+	stateless                  bool
+	disableLocalhostProtection bool
+	maxResponseSize            int64
+	disableResources           bool
+	customHeaders              map[string]string
+	passthroughHeaders         []string
+	defaultTenantID            string
+	authToken                  string
+	instructionsOverride       string
 
 	// Logging configuration
 	logFormat string
@@ -96,6 +102,19 @@ func InitConfig() (*Config, error) {
 		heartbeatInterval = interval
 	}
 
+	maxResponseSize := int64(defaultMaxResponseSize)
+	maxResponseSizeStr := os.Getenv("MCP_MAX_RESPONSE_SIZE")
+	if maxResponseSizeStr != "" {
+		size, err := strconv.ParseInt(maxResponseSizeStr, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse MCP_MAX_RESPONSE_SIZE: %w", err)
+		}
+		if size < 0 {
+			return nil, fmt.Errorf("MCP_MAX_RESPONSE_SIZE must be non-negative")
+		}
+		maxResponseSize = size
+	}
+
 	disableResources := false
 	disableResourcesStr := os.Getenv("MCP_DISABLE_RESOURCES")
 	if disableResourcesStr != "" {
@@ -103,6 +122,26 @@ func InitConfig() (*Config, error) {
 		disableResources, err = strconv.ParseBool(disableResourcesStr)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse MCP_DISABLE_RESOURCES: %w", err)
+		}
+	}
+
+	stateless := false
+	statelessStr := os.Getenv("MCP_STATELESS")
+	if statelessStr != "" {
+		var err error
+		stateless, err = strconv.ParseBool(statelessStr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse MCP_STATELESS: %w", err)
+		}
+	}
+
+	disableLocalhostProtection := false
+	disableLocalhostProtectionStr := os.Getenv("MCP_DISABLE_LOCALHOST_PROTECTION")
+	if disableLocalhostProtectionStr != "" {
+		var err error
+		disableLocalhostProtection, err = strconv.ParseBool(disableLocalhostProtectionStr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse MCP_DISABLE_LOCALHOST_PROTECTION: %w", err)
 		}
 	}
 
@@ -122,21 +161,26 @@ func InitConfig() (*Config, error) {
 		return nil, fmt.Errorf("MCP_LOG_LEVEL must be 'debug', 'info', 'warn' or 'error'")
 	}
 	result := &Config{
-		serverMode:         strings.ToLower(os.Getenv("MCP_SERVER_MODE")),
-		listenAddr:         os.Getenv("MCP_LISTEN_ADDR"),
-		entrypoint:         os.Getenv("VM_INSTANCE_ENTRYPOINT"),
-		instanceType:       os.Getenv("VM_INSTANCE_TYPE"),
-		bearerToken:        os.Getenv("VM_INSTANCE_BEARER_TOKEN"),
-		disabledTools:      disabledToolsMap,
-		apiKey:             os.Getenv("VMC_API_KEY"),
-		apiBaseURL:         os.Getenv("VMC_API_BASE_URL"),
-		heartbeatInterval:  heartbeatInterval,
-		disableResources:   disableResources,
-		customHeaders:      customHeadersMap,
-		passthroughHeaders: passthroughHeaders,
-		logFormat:          logFormat,
-		logLevel:           logLevel,
-		defaultTenantID:    "0",
+		serverMode:                 strings.ToLower(os.Getenv("MCP_SERVER_MODE")),
+		listenAddr:                 os.Getenv("MCP_LISTEN_ADDR"),
+		entrypoint:                 os.Getenv("VM_INSTANCE_ENTRYPOINT"),
+		instanceType:               os.Getenv("VM_INSTANCE_TYPE"),
+		bearerToken:                os.Getenv("VM_INSTANCE_BEARER_TOKEN"),
+		disabledTools:              disabledToolsMap,
+		apiKey:                     os.Getenv("VMC_API_KEY"),
+		apiBaseURL:                 os.Getenv("VMC_API_BASE_URL"),
+		heartbeatInterval:          heartbeatInterval,
+		stateless:                  stateless,
+		disableLocalhostProtection: disableLocalhostProtection,
+		maxResponseSize:            maxResponseSize,
+		disableResources:           disableResources,
+		customHeaders:              customHeadersMap,
+		passthroughHeaders:         passthroughHeaders,
+		authToken:                  os.Getenv("MCP_AUTH_TOKEN"),
+		instructionsOverride:       strings.TrimSpace(os.Getenv("MCP_INSTRUCTIONS_OVERRIDE")),
+		logFormat:                  logFormat,
+		logLevel:                   logLevel,
+		defaultTenantID:            "0",
 	}
 	// Left for backward compatibility
 	if result.listenAddr == "" {
@@ -254,6 +298,20 @@ func (c *Config) HeartbeatInterval() time.Duration {
 	return c.heartbeatInterval
 }
 
+func (c *Config) Stateless() bool {
+	return c.stateless
+}
+
+func (c *Config) DisableLocalhostProtection() bool {
+	return c.disableLocalhostProtection
+}
+
+// MaxResponseSize returns the maximum size in bytes of a VictoriaMetrics response
+// a tool reads. Zero means no limit.
+func (c *Config) MaxResponseSize() int64 {
+	return c.maxResponseSize
+}
+
 func (c *Config) CustomHeaders() map[string]string {
 	return c.customHeaders
 }
@@ -272,4 +330,14 @@ func (c *Config) LogLevel() string {
 
 func (c *Config) DefaultTenantID() string {
 	return c.defaultTenantID
+}
+
+func (c *Config) AuthToken() string {
+	return c.authToken
+}
+
+// InstructionsOverride returns text that replaces the default MCP server instructions.
+// Empty means the default instructions are used.
+func (c *Config) InstructionsOverride() string {
+	return c.instructionsOverride
 }

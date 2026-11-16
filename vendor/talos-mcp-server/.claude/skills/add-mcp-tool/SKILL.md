@@ -43,7 +43,7 @@ then proceed non-interactively.
 
 6. **Generate test stub.** Write `internal/tools/<name>_test.go` with one
    happy-path test and (for `mutating`) a guards-enforcement test.
-7. **Format.** Run `gofmt -w internal/tools/<name>.go internal/tools/<name>_test.go`.
+7. **Format.** Run `make fmt-fix`.
 8. **Update inventory.** Edit the tool-inventory tables in `AGENTS.md` and
    `README.md`. Preserve alphabetical order.
 
@@ -58,7 +58,7 @@ Modified:  <registration-file>
            AGENTS.md  (tool inventory)
            README.md  (tool inventory)
 Next:      make check
-           invoke staff-reviewer  →  .claude/reviews/<change-id>/review.md
+           review per AGENTS.md § Review flow  →  .claude/reviews/<change-id>/review.md
            commit  →  feat(tools): add <tool_name> handler [review:<change-id>]
 ```
 

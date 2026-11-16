@@ -1,6 +1,7 @@
 ---
 weight: 0
 title: Helm Charts
+description: "All VictoriaMetrics Helm charts. Add repo, install, and upgrade."
 menu:
   docs:
     weight: 35
@@ -45,8 +46,8 @@ The command must display existing helm chart e.g.
 
 ```shell
 NAME                             	CHART VERSION	APP VERSION         	DESCRIPTION
-vm/victoria-logs-cluster                0.0.33          v1.50.0                 VictoriaLogs cluster version - high-performance...
-vm/victoria-logs-single                 0.11.32         v1.50.0                 Victoria Logs Single version - high-performance...
+vm/victoria-logs-cluster                0.2.9           v1.53.0                 VictoriaLogs cluster version - high-performance...
+vm/victoria-logs-single                 0.13.10         v1.53.0                 Victoria Logs Single version - high-performance...
 vm/victoria-metrics-agent               0.19.0          v1.116.0                Victoria Metrics Agent - collects metrics from ...
 vm/victoria-metrics-alert               0.18.0          v1.116.0                Victoria Metrics Alert - executes a list of giv...
 vm/victoria-metrics-anomaly             1.9.1           v1.22.0-experimental    Victoria Metrics Anomaly Detection - a service ...
@@ -160,3 +161,15 @@ helm charts tested at kubernetes versions from 1.28 to 1.30.
 - [VictoriaMetrics Operator CRDs](https://docs.victoriametrics.com/helm/victoria-metrics-operator-crds/)
 - [VictoriaTraces Single](https://docs.victoriametrics.com/helm/victoria-traces-single/)
 - [VictoriaTraces Cluster](https://docs.victoriametrics.com/helm/victoria-traces-cluster/)
+
+### Operator-based charts
+
+Most charts render Kubernetes workloads (Deployments, StatefulSets, DaemonSets, Services) directly, so their workload settings are configured through chart values.
+The following charts render [VictoriaMetrics operator](https://docs.victoriametrics.com/operator/) custom resources instead, and the operator creates the workloads from them:
+
+- [VictoriaMetrics K8s Stack](https://docs.victoriametrics.com/helm/victoria-metrics-k8s-stack/) installs the operator by default (`victoria-metrics-operator.enabled`);
+- [VictoriaMetrics Distributed](https://docs.victoriametrics.com/helm/victoria-metrics-distributed/) installs the operator by default through its `victoria-metrics-k8s-stack` dependency; if that dependency or its `victoria-metrics-operator` subchart is disabled, the operator must already be installed.
+
+For VictoriaMetrics, VictoriaLogs and VictoriaTraces components of these charts, workloads can be configured only through the fields of the custom resource spec, see the [operator API reference](https://docs.victoriametrics.com/operator/api/).
+Bundled third-party subcharts, such as grafana and kube-state-metrics, are still configured with their chart values.
+If you need full control over Kubernetes resources, use the standalone charts for each component instead.

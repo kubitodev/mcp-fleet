@@ -14,51 +14,6 @@ import (
 	"github.com/Nosmoht/talos-mcp-server/internal/talos"
 )
 
-func TestParseMetaKey(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name    string
-		input   string
-		want    uint8
-		wantErr string
-	}{
-		{name: "decimal", input: "6", want: 6},
-		{name: "decimal max", input: "255", want: 255},
-		{name: "decimal zero", input: "0", want: 0},
-		{name: "hex lower", input: "0x0c", want: 12},
-		{name: "hex upper", input: "0X0C", want: 12},
-		{name: "explicit octal", input: "0o17", want: 15},
-		{name: "empty", input: "", wantErr: "must not be empty"},
-		{name: "leading zero rejected", input: "06", wantErr: "ambiguous leading zero"},
-		{name: "leading zero rejected (long)", input: "013", wantErr: "ambiguous leading zero"},
-		{name: "overflow", input: "256", wantErr: "exceeds META key range"},
-		{name: "non-numeric", input: "abc", wantErr: "invalid syntax"},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			got, err := parseMetaKey(tc.input)
-			if tc.wantErr != "" {
-				if err == nil {
-					t.Fatalf("expected error containing %q, got nil", tc.wantErr)
-				}
-				if !strings.Contains(err.Error(), tc.wantErr) {
-					t.Fatalf("error %q does not contain %q", err.Error(), tc.wantErr)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if got != tc.want {
-				t.Errorf("got %d, want %d", got, tc.want)
-			}
-		})
-	}
-}
-
 // TestHandleMeta_Guards verifies the action / confirm / privileged-key /
 // insecure gates of talos_meta. The mock client panics on Meta* calls, so
 // reaching the gRPC layer surfaces as a test failure.
@@ -223,24 +178,15 @@ func TestReadMetaFromCOSI_ResourceIdentity(t *testing.T) {
 		t.Fatalf("seed MetaKey: %v", err)
 	}
 
-	var (
-		outcome  = OutcomeOK
-		finalErr error
-	)
-
-	_, structured, err := readMetaFromCOSI(ctx, st, testKey, &outcome, &finalErr)
+	resultMap, outcome, err := readMetaFromCOSI(ctx, st, testKey)
 	if err != nil {
 		t.Fatalf("readMetaFromCOSI: %v (outcome=%s) — does the resource type or id format match upstream pkg/machinery/resources/runtime?", err, outcome)
 	}
 	if outcome != OutcomeOK {
 		t.Errorf("outcome = %q, want %q", outcome, OutcomeOK)
 	}
-	if structured == nil {
+	if resultMap == nil {
 		t.Fatal("expected non-nil structured result")
-	}
-	resultMap, ok := structured.(map[string]any)
-	if !ok {
-		t.Fatalf("structured result is not map[string]any: %T", structured)
 	}
 	if resultMap["action"] != "read" {
 		t.Errorf("action = %v, want read", resultMap["action"])
@@ -267,20 +213,12 @@ func TestReadMetaFromCOSI_NotFound(t *testing.T) {
 	ctx := context.Background()
 	st := state.WrapCore(namespaced.NewState(inmem.Build))
 
-	var (
-		outcome  = OutcomeOK
-		finalErr error
-	)
-
-	_, _, err := readMetaFromCOSI(ctx, st, 99, &outcome, &finalErr)
+	_, outcome, err := readMetaFromCOSI(ctx, st, 99)
 	if err == nil {
 		t.Fatal("expected error for non-existent key, got nil")
 	}
 	if outcome != OutcomeRPCError {
 		t.Errorf("outcome = %q, want %q", outcome, OutcomeRPCError)
-	}
-	if finalErr == nil {
-		t.Error("finalErr should be set when err is non-nil")
 	}
 }
 
@@ -310,4 +248,71 @@ func TestHandleMeta_PrivilegedKeyAllowlisted(t *testing.T) {
 		Value:   "x",
 		Confirm: true,
 	})
+}
+
+// TestHandleMeta_InsecureMutationReachesDialedClient: in maintenance mode a
+// confirmed write or delete of a UserReserved key reaches the dialed client with
+// the parsed key and the raw value (MetaArgs schema).
+func TestHandleMeta_InsecureMutationReachesDialedClient(t *testing.T) {
+	t.Parallel()
+
+	const (
+		keyArg       = "0x0c"
+		key    uint8 = 0x0c // UserReserved1
+		value        = "reserved-value"
+	)
+
+	type metaCall struct {
+		WriteKey   int
+		WriteValue string
+		DeleteKey  int
+	}
+	const none = -1
+
+	tests := []struct {
+		name string
+		args MetaArgs
+		want metaCall
+	}{
+		{
+			name: "write",
+			args: MetaArgs{Action: "write", Key: keyArg, Value: value, Confirm: true},
+			want: metaCall{WriteKey: int(key), WriteValue: value, DeleteKey: none},
+		},
+		{
+			name: "delete",
+			args: MetaArgs{Action: "delete", Key: keyArg, Confirm: true},
+			want: metaCall{WriteKey: none, DeleteKey: int(key)},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			fake := &fakeMaintenanceClient{}
+			h := insecureHandlers(t, &recordingDialer{client: fake})
+
+			args := tc.args
+			args.Insecure = true
+			args.Endpoint = insecureTestEndpoint
+			if _, _, err := h.HandleMeta(context.Background(), nil, args); err != nil {
+				t.Fatalf("talos_meta insecure %s: unexpected error %v", tc.name, err)
+			}
+
+			got := metaCall{WriteKey: none, WriteValue: string(fake.gotMetaWriteValue), DeleteKey: none}
+			if fake.gotMetaWriteKey != nil {
+				got.WriteKey = int(*fake.gotMetaWriteKey)
+			}
+			if fake.gotMetaDeleteKey != nil {
+				got.DeleteKey = int(*fake.gotMetaDeleteKey)
+			}
+			if got != tc.want {
+				t.Errorf("MetaArgs schema: %s of key %s want %+v got %+v", tc.name, keyArg, tc.want, got)
+			}
+			if !fake.closed {
+				t.Errorf("dialInsecure contract: talos_meta insecure %s must Close() the dialed client", tc.name)
+			}
+		})
+	}
 }

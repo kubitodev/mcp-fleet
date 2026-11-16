@@ -46,12 +46,12 @@ New releases appear on npmjs.com within minutes of every `feat:` / `fix:` / `per
 
 Download the latest release from [GitHub Releases](https://github.com/Nosmoht/talos-mcp-server/releases), extract, and place the binary in your `$PATH`.
 
-**Build from source** (requires Go 1.21+):
+**Build from source** (Go version as set in `go.mod`; tools via [mise](https://mise.jdx.dev)):
 
 ```bash
 git clone https://github.com/Nosmoht/talos-mcp-server
-cd talos-mcp
-go build -o talos-mcp ./cmd/talos-mcp
+cd talos-mcp-server
+make build
 ```
 
 ## Configuration
@@ -68,11 +68,12 @@ Reads `~/.talos/config` by default (the same file `talosctl` uses). Override via
 | `TALOS_MCP_AUTH_TOKEN` | (unset) | Required bearer token when HTTP mode is active |
 | `TALOS_MCP_ALLOWED_NODES` | (unset) | Comma-separated IPs, hostnames, and CIDR ranges permitted as tool targets. Unset allows all. |
 | `TALOS_MCP_ALLOWED_PATHS` | *(all)* | Comma-separated path prefixes allowed for `talos_read_file` and `talos_list_files` (e.g. `/etc,/proc`). Defense-in-depth only — checks run on the MCP server host and do **not** resolve symlinks on the remote Talos node, so a symlink under an allowed prefix that points elsewhere is not detected. |
-| `TALOS_MCP_SKIP_VERSION_CHECK` | `false` | Set to `true` to bypass upgrade path validation (e.g. for factory images or custom tags) |
+| `TALOS_MCP_SKIP_VERSION_CHECK` | `false` | Set to `true` to bypass upgrade path validation (e.g. when the node's version cannot be read, or the target is newer than this server's machinery) |
 | `TALOS_MCP_ENABLE_INSECURE` | `false` | Unlock `insecure=true` on `talos_apply_config` / `talos_get` / `talos_version` / `talos_meta`. Bypasses mTLS — REQUIRES `TALOS_MCP_INSECURE_ALLOWED_NODES`. |
 | `TALOS_MCP_INSECURE_ALLOWED_NODES` | (unset) | Comma-separated IPs / CIDRs permitted as maintenance-mode endpoints. Required when `TALOS_MCP_ENABLE_INSECURE=true`. Refused: `0.0.0.0/0`, `::/0`, IPv4 mask `<16`, IPv6 mask `<48`. |
 | `TALOS_MCP_META_PRIVILEGED_KEYS` | *(none)* | Comma-separated META keys (decimal or `0x`-prefixed hex) that `talos_meta` is allowed to write/delete beyond `UserReserved1/2/3`. |
-| `TALOS_MCP_SAFETY_PROFILE` | (unset) | `conservative` / `standard` / `expert` preset that seeds gating flags. `expert` enables `EnableInsecure`. |
+| `TALOS_MCP_BLOCKED_CONFIG_PATHS` | (unset) | Comma-separated dot-paths (e.g. `machine.security,cluster.etcd`) that `talos_patch_config` refuses to change. Every document of a multi-document patch is inspected; a `$patch` directive counts as changing the mapping that holds it (a top-level one, the whole document); a patch containing a typed document (`apiVersion`/`kind`) is refused. While set, the authenticated `talos_apply_config` path is disabled. |
+| `TALOS_MCP_SAFETY_PROFILE` | (unset) | `conservative` / `standard` / `expert` preset that seeds gating flags. `expert` enables `EnableInsecure`. Any other value, an empty one included, stops the server at startup. |
 | `TALOS_MCP_RATE_LIMIT` | `10` | HTTP mode: token-bucket refill rate (requests/second, float) |
 | `TALOS_MCP_RATE_BURST` | `20` | HTTP mode: token-bucket burst capacity (int) |
 | `TALOS_MCP_MAX_BODY_SIZE` | `4194304` | HTTP mode: max POST request body size in bytes (4 MiB default) |
@@ -80,21 +81,29 @@ Reads `~/.talos/config` by default (the same file `talosctl` uses). Override via
 | `TALOS_MCP_SUBSCRIPTION_RATE` | `1s` | Minimum interval between delivered `resources/updated` notifications per `(session, URI)` pair (Go duration, e.g. `500ms`) |
 | `TALOS_MCP_SUBSCRIPTION_BURST` | `3` | Initial notification burst per `(session, URI)` before the rate kicks in |
 
+The boolean `TALOS_MCP_*` flags accept the Go `strconv.ParseBool` spellings `1`, `t`, `T`, `TRUE`, `true`, `True`, `0`, `f`, `F`, `FALSE`, `false`, `False`; any other value, an empty one included, stops the server at startup.
+
 ## Compatibility
 
-This server is tested against Talos Linux v1.9.x through v1.13.x.
+This server is tested against Talos Linux v1.9.x through v1.14.x.
 
-| talos-mcp | Talos Linux | machinery SDK |
-|-----------|-------------|---------------|
-| v0.x (current) | v1.9.0 – v1.13.x | v1.13.4 |
+| talos-mcp | Talos Linux | machinery SDK | MCP go-sdk |
+|-----------|-------------|---------------|------------|
+| v0.x (current) | v1.9.0 – v1.14.x | v1.14.5 | v1.8.0 |
 
-The server logs a startup warning if the connected cluster's Talos version is outside the tested range. All 19 gRPC methods used have been stable since Talos v1.9.
+The server logs a startup warning if the connected cluster's Talos version is outside the tested range. All gRPC methods used have been stable since Talos v1.9.
+
+### MCP protocol revisions
+
+Stdio mode serves MCP protocol revision `2026-07-28` and the legacy revisions up to `2025-11-25` (`initialize` handshake).
+
+Streamable HTTP mode is stateful and serves legacy revisions up to `2025-11-25` only; `2026-07-28` clients negotiate down to `2025-11-25` or receive a JSON-RPC error.
 
 ### Upgrade path validation
 
-The `talos_upgrade` tool validates that the target version follows Talos's supported upgrade path — at most one minor version at a time (e.g. v1.11.x → v1.12.x). Upgrades that skip minor versions are rejected with an error.
+Before it sends the upgrade, the `talos_upgrade` tool checks the path from the node's current version to the image's version against the same machinery rules the target installer enforces on the node. The installer runs its own check only after it has drained the node and stopped its services. The tool refuses an upgrade when the path is not allowed, when the node's version cannot be read, or when the target version is newer than the machinery compiled into this server knows. Paths the target release accepts pass, including some that skip a minor version, some downgrades and reinstalls of the same version.
 
-If your image uses a custom or factory tag (e.g. `factory.talos.dev/...` or `:latest`) the tag cannot be parsed and validation is skipped automatically. To bypass validation explicitly, set `TALOS_MCP_SKIP_VERSION_CHECK=true`.
+If the image tag carries no version (e.g. `:latest`), the path cannot be checked: the tool logs a warning and proceeds. To bypass the check, set `TALOS_MCP_SKIP_VERSION_CHECK=true`.
 
 ## Client Setup
 
@@ -151,6 +160,8 @@ The server speaks the [MCP protocol](https://modelcontextprotocol.io) over stdio
 ./talos-mcp
 ```
 
+Server logs go to stderr only; the server sends no MCP `notifications/message` log notifications and does not advertise the `logging` capability.
+
 ## Tools
 
 <!-- inventory:tools:start -->
@@ -169,9 +180,9 @@ The server speaks the [MCP protocol](https://modelcontextprotocol.io) over stdio
 | `talos_dmesg` | Read kernel ring buffer messages. |
 | `talos_events` | Fetch recent Talos runtime events (service changes, config changes). |
 | `talos_etcd` | Query etcd cluster: `members` (default) or `status`. |
-| `talos_etcd_snapshot` | Stream an etcd snapshot to a local file path. |
+| `talos_etcd_snapshot` | Stream an etcd snapshot to a new owner-only (0600) local file; an existing path, and a path through a symlink owned by neither root nor the server's user, is refused. The result includes the byte count and sha256. |
 | `talos_list_files` | List files and directories on a node filesystem. |
-| `talos_read_file` | Read file contents from a node filesystem. |
+| `talos_read_file` | Read the contents of a single file from exactly one target node's filesystem (e.g. /etc/os-release, /etc/machine-config.yaml). Passing more than one node is rejected. To browse directories first use talos_list_files. |
 | `talos_validate` | Validate a machine config (YAML/JSON) offline — no cluster connection. |
 
 ### Mutating
@@ -184,12 +195,12 @@ These tools modify cluster state and have explicit safety guards.
 | `talos_reboot` | Reboot target nodes. Supports `mode`: `default`, `powercycle`, `force`. | `confirm=true` required; `nodes` must be explicit |
 | `talos_upgrade` | Upgrade Talos on target nodes. Supports `preserve` (default `true`), `stage`, `force`, `reboot_mode`. | `confirm=true` required; `nodes` and `image` required |
 | `talos_rollback` | Roll back the last upgrade on target nodes. | `confirm=true` required; `nodes` must be explicit |
-| `talos_patch_config` | Apply a targeted machine config patch (strategic-merge or RFC 6902 JSON Patch). | `dry_run` defaults to `true`; `confirm=true` required when `dry_run=false` |
+| `talos_patch_config` | Apply a targeted machine config patch (strategic-merge or RFC 6902 JSON Patch). | `dry_run` defaults to `true`; `confirm=true` required when `dry_run=false`; a second authenticated config write while one runs is refused (`config write in progress`; retry); a write unfinished after 30s is cancelled and, with `dry_run=false`, reports an unknown outcome (check `talos_get machineconfig`) |
 | `talos_reset` | Wipe and factory-reset target nodes (irreversible). | `confirm=true` required; `nodes` must be explicit |
-| `talos_apply_config` | Apply a complete machine config to a single node. Supports maintenance-mode (`insecure=true` + `endpoint`) for fresh-node bootstrap. | `dry_run` defaults to `true`; `confirm=true` required when `dry_run=false` |
+| `talos_apply_config` | Apply a complete machine config to a single node. Supports maintenance-mode (`insecure=true` + `endpoint`) for fresh-node bootstrap. | `dry_run` defaults to `true`; `confirm=true` required when `dry_run=false`; a second authenticated config write while one runs is refused (`config write in progress`; retry); an authenticated write unfinished after 30s is cancelled and, with `dry_run=false`, reports an unknown outcome (check `talos_get machineconfig`); maintenance mode has no such limit |
 | `talos_meta` | Read, write, or delete META partition key/value pairs. Supports maintenance-mode (`insecure=true` + `endpoint`). | `write`/`delete` require `confirm=true`; non-`UserReserved*` keys require enumeration in `TALOS_MCP_META_PRIVILEGED_KEYS` |
 
-All tools accept an optional `nodes` field (list of node IPs or hostnames). When omitted, the active context from talosconfig is used.
+All tools accept an optional `nodes` field (list of node IPs or hostnames), except that `talos_read_file`, `talos_get`, `talos_patch_config`, `talos_apply_config` and `talos_meta` with `action=read` accept at most one node, and `talos_etcd_snapshot` requires exactly one. When omitted, the active context from talosconfig is used.
 
 #### Maintenance-mode (`--insecure`) operations
 
@@ -224,7 +235,7 @@ The server exposes Talos COSI resources as MCP resources:
 - `talos://cluster/resource-definitions` — discover resource types.
 - `talos://{node}/resource/{namespace}/{type}[/{id}]` — list or get COSI resources on a specific node.
 
-MCP clients that implement `resources/subscribe` (Claude Desktop, Cursor) receive `notifications/resources/updated` whenever the underlying resource changes — no polling required. Subscriptions are backed by the Talos COSI `Watch` / `WatchKindAggregated` streams and honour the same `TALOS_MCP_ALLOWED_NODES` allowlist as reads.
+MCP clients that implement `resources/subscribe` (legacy revisions up to `2025-11-25`; Claude Desktop, Cursor) or `subscriptions/listen` (revision `2026-07-28`) receive `notifications/resources/updated` whenever the underlying resource changes — no polling required. Subscriptions are backed by the Talos COSI `Watch` / `WatchKindAggregated` streams and honour the same `TALOS_MCP_ALLOWED_NODES` allowlist as reads.
 
 Subscribable resource types (canonical names):
 
@@ -276,7 +287,7 @@ MCP Client (Claude Code / Codex)
 | Confirm gates | Always require `confirm=true`: `talos_service_action`, `talos_reboot`, `talos_upgrade`, `talos_rollback`, `talos_reset`. Require `confirm=true` when `dry_run=false`: `talos_patch_config`, `talos_apply_config`. All enforced server-side. |
 | Preserve default | `talos_upgrade` defaults `preserve` to `true` (keep EPHEMERAL partition) — differs from `talosctl` default of `false` |
 | Dry-run default | `talos_patch_config` defaults to `dry_run=true`; applying requires both `dry_run=false` and `confirm=true` |
-| Audit logging | All mutating tool calls (`talos_service_action`, `talos_reboot`, `talos_upgrade`, `talos_rollback`, `talos_reset`, `talos_patch_config`, `talos_apply_config`) emit a structured log line to stderr: `AUDIT timestamp=<RFC3339> tool=<name> nodes=<list> args=<json>` (patch content is redacted) |
+| Audit logging | Every mutating tool call and every call to a tool that accepts `insecure=true` emits a structured `slog` INFO record `AUDIT` to stderr with the fields `tool`, `nodes` and `args` (patch content is redacted). Tools that accept `insecure=true` also emit an `AUDIT_OUTCOME` record with the fields `tool`, `outcome` and `error`. |
 
 ### What Is Not in the Threat Model
 
@@ -350,17 +361,19 @@ A passing result means the package was published by the official GitHub Actions 
 ## Development
 
 ```bash
+# Tools come from mise (https://mise.jdx.dev); mise exec fetches them on first use
+
 # Build
-go build -o talos-mcp ./cmd/talos-mcp
+mise exec -- go build -o talos-mcp ./cmd/talos-mcp
 
 # Test
-go test -race ./...
+mise exec -- go test -race ./...
 
-# Lint (requires golangci-lint v2)
-golangci-lint run
+# Lint
+mise exec -- golangci-lint run
 
 # Format check
-gofmt -l .
+mise exec -- gofmt -l .
 ```
 
 ## License

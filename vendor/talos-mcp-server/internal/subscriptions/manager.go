@@ -11,7 +11,7 @@
 // Bootstrapped events from COSI Watch are intentionally dropped: the MCP
 // client is expected to call resources/read once after subscribe to obtain
 // initial state. Forwarding Bootstrapped risks a race against the SDK's
-// internal session-registration map (go-sdk mcp/server.go:892-909: the
+// internal session-registration map (go-sdk v1.8.0 mcp/server.go:1219-1228: the
 // SubscribeHandler returns before the session is inserted into
 // resourceSubscriptions, so a very-early ResourceUpdated call would be
 // dropped silently by the SDK).
@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/cosi-project/runtime/pkg/resource"
+	"github.com/cosi-project/runtime/pkg/resource/meta"
 	cosistate "github.com/cosi-project/runtime/pkg/state"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"golang.org/x/time/rate"
@@ -46,6 +47,14 @@ var AllowedTypes = map[string]struct{}{
 	"Services.v1alpha1.talos.dev":       {},
 }
 
+// Source is the Talos API surface the Manager watches through.
+type Source interface {
+	ResolveResourceKind(ctx context.Context, resourceNamespace *resource.Namespace, resourceType resource.Type) (*meta.ResourceDefinition, error)
+	COSIState() cosistate.State
+}
+
+var _ Source = (*talos.Client)(nil)
+
 // notifyFunc is the injection seam that decouples the Manager from
 // *mcp.Server in tests. Production binds it to Server.ResourceUpdated
 // via BindServer.
@@ -54,7 +63,7 @@ type notifyFunc func(ctx context.Context, uri string) error
 // Manager serializes subscribe/unsubscribe/supervise operations and owns the
 // long-lived goroutines that fan COSI Watch events into MCP notifications.
 type Manager struct {
-	client       talos.ClientInterface
+	client       Source
 	allowedNodes *talos.NodeAllowlist
 	rateEvery    time.Duration
 	rateBurst    int
@@ -81,7 +90,7 @@ type subscription struct {
 // NewManager builds a Manager rooted in a Background-derived context.
 // Call BindServer after the MCP server is constructed; call Shutdown from
 // main.go's cleanup path to drain all goroutines.
-func NewManager(client talos.ClientInterface, allowedNodes *talos.NodeAllowlist, rateEvery time.Duration, rateBurst int) *Manager {
+func NewManager(client Source, allowedNodes *talos.NodeAllowlist, rateEvery time.Duration, rateBurst int) *Manager {
 	root, cancel := context.WithCancel(context.Background())
 	return &Manager{
 		client:       client,
@@ -125,9 +134,9 @@ func (m *Manager) Unsubscribe(_ context.Context, req *mcp.UnsubscribeRequest) er
 	return nil
 }
 
-// SuperviseSession blocks on ss.Wait() and tears down every subscription
-// owned by the session when it disconnects. One supervisor goroutine per
-// session; installed from the wrapped InitializedHandler in main.go.
+// SuperviseSession blocks on ss.Wait() and tears down the session's
+// subscriptions on disconnect; main.go starts it for initialize-based sessions
+// only. 2026-07-28 sessions reach Unsubscribe through the SDK's listen-deferred call.
 func (m *Manager) SuperviseSession(ss *mcp.ServerSession) {
 	_ = ss.Wait()
 	m.cleanupSession(ss.ID())

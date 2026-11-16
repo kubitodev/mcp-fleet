@@ -1,9 +1,13 @@
 package cgroup
 
 import (
+	"fmt"
+	"math"
 	"os"
+	"path"
 	"runtime/debug"
 	"strconv"
+	"strings"
 )
 
 // GetGOGC returns GOGC value for the currently running process.
@@ -42,19 +46,52 @@ func GetMemoryLimit() int64 {
 		return n
 	}
 	n, err = getMemStatV2("memory.max")
-	if err != nil {
+	if err != nil || n <= 0 {
 		return 0
 	}
 	return n
 }
 
 func getMemStatV2(statName string) (int64, error) {
-	// See https: //www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html#memory-interface-files
-	return getStatGeneric(statName, "/sys/fs/cgroup", "/proc/self/cgroup", "")
+	// See https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html#memory-interface-files
+	return getMemLimitV2("/sys/fs/cgroup", "/proc/self/cgroup", statName)
+}
+
+func getMemLimitV2(sysfsPrefix, cgroupPath, statName string) (int64, error) {
+	subPath, err := readCgroupV2SubPath(cgroupPath)
+	if err != nil {
+		subPath = "/"
+	}
+	var minLimit int64 = -1
+	for {
+		// travers sub path hierarchy and use a minimal value for stat
+		data, err := os.ReadFile(path.Join(sysfsPrefix, subPath, statName))
+		if err == nil {
+			s := strings.TrimSpace(string(data))
+			if s != "max" {
+				n, err := strconv.ParseInt(s, 10, 64)
+				if err != nil {
+					return 0, fmt.Errorf("cannot parse %s at %s: %w", statName, subPath, err)
+				}
+				if n > 0 && (minLimit < 0 || n < minLimit) {
+					minLimit = n
+				}
+			}
+		}
+		if subPath == "/" || subPath == "." {
+			break
+		}
+		subPath = path.Dir(subPath)
+	}
+	return minLimit, nil
 }
 
 func getMemStat(statName string) (int64, error) {
-	return getStatGeneric(statName, "/sys/fs/cgroup/memory", "/proc/self/cgroup", "memory")
+	n, err := getStatGeneric(statName, "/sys/fs/cgroup/memory", "/proc/self/cgroup", "memory")
+	if err != nil {
+		return 0, err
+	}
+	return normalizeMemoryLimitV1(n), nil
 }
 
 // GetHierarchicalMemoryLimit returns hierarchical memory limit
@@ -77,5 +114,19 @@ func getHierarchicalMemoryLimit(sysfsPrefix, cgroupPath string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	return strconv.ParseInt(memStat, 10, 64)
+	n, err := strconv.ParseInt(memStat, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return normalizeMemoryLimitV1(n), nil
+}
+
+func normalizeMemoryLimitV1(n int64) int64 {
+	// Cgroup v1 uses math.MaxInt64 rounded down to the page size for an unlimited value.
+	pageSize := int64(os.Getpagesize())
+	noLimit := math.MaxInt64 / pageSize * pageSize
+	if n <= 0 || n >= noLimit {
+		return 0
+	}
+	return n
 }

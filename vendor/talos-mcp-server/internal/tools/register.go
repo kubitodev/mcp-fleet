@@ -1,6 +1,9 @@
 package tools
 
-import "github.com/modelcontextprotocol/go-sdk/mcp"
+import (
+	"github.com/google/jsonschema-go/jsonschema"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+)
 
 // Tool descriptions are centralised in this const block (rather than inline at
 // each AddTool call) so the agent-facing "which tool for what" routing contract
@@ -51,16 +54,17 @@ const (
 	descEtcd = "Query etcd cluster membership and health from a control-plane node. " +
 		"Use this for etcd rather than talos_get type=Member. subcommand='members' (default) or 'status'."
 
-	descEtcdSnapshot = "Take an etcd backup snapshot from a single control-plane node and write it to a local file. " +
+	descEtcdSnapshot = "Take an etcd backup snapshot from a single control-plane node and write it to a new owner-only (0600) local file. " +
 		"Requires exactly one control-plane node in nodes[]. " +
-		"Returns the file path and byte count on success. " +
+		"An existing file or symlink at the path is refused. " +
+		"Returns the file path, byte count and sha256 on success. " +
 		"May take up to 5 minutes on large clusters."
 
 	descListFiles = "List files and directories at a path on a target node's filesystem. " +
 		"To read a file's contents use talos_read_file."
 
-	descReadFile = "Read the contents of a single file from a target node's filesystem (e.g. /etc/os-release, /etc/machine-config.yaml). " +
-		"To browse directories first use talos_list_files."
+	descReadFile = "Read the contents of a single file from exactly one target node's filesystem (e.g. /etc/os-release, /etc/machine-config.yaml). " +
+		"Passing more than one node is rejected. To browse directories first use talos_list_files."
 
 	descValidate = "Validate a Talos machine config (YAML or JSON) offline — no cluster connection required. " +
 		"Use mode='metal' (default), 'cloud', or 'container'. " +
@@ -95,7 +99,11 @@ const (
 		"Defaults to dry_run=true — set dry_run=false to actually apply. " +
 		"Requires confirm=true when dry_run=false. " +
 		"Targets exactly one node. " +
-		"Note: Talos may reject an RFC 6902 patch against a multi-document machine config — prefer a strategic-merge patch there."
+		"Note: Talos may reject an RFC 6902 patch against a multi-document machine config — prefer a strategic-merge patch there. " +
+		"A config write (patch or apply) that arrives while another authenticated one runs is refused with 'config write in progress'; retry when it completes. " +
+		"While TALOS_MCP_BLOCKED_CONFIG_PATHS is set, a patch containing a typed config document (apiVersion/kind) is refused, " +
+		"and a $patch directive counts as changing the whole mapping that holds it. " +
+		"A config write that has not finished after 30s is cancelled; with dry_run=false its outcome is then unknown — check the node with talos_get machineconfig before retrying."
 
 	descReset = "Wipe and factory-reset the specified nodes. IRREVERSIBLE: all data on the system disk is permanently destroyed. " +
 		"Requires explicit nodes and confirm=true. " +
@@ -114,7 +122,9 @@ const (
 		"Config must target exactly one node — each node has a unique machine config. " +
 		"When TALOS_MCP_BLOCKED_CONFIG_PATHS is set, the authenticated path is disabled (use talos_patch_config for targeted, blocklist-checked changes); maintenance mode is governed separately by the insecure-mode allowlist gates. " +
 		"For bootstrapping a fresh node in maintenance mode, set insecure=true + endpoint=<node-IP>; " +
-		"requires TALOS_MCP_ENABLE_INSECURE=true and an entry in TALOS_MCP_INSECURE_ALLOWED_NODES."
+		"requires TALOS_MCP_ENABLE_INSECURE=true and an entry in TALOS_MCP_INSECURE_ALLOWED_NODES. " +
+		"A config write (patch or apply) that arrives while another authenticated one runs is refused with 'config write in progress'; retry when it completes. " +
+		"An authenticated config write that has not finished after 30s is cancelled; with dry_run=false its outcome is then unknown — check the node with talos_get machineconfig before retrying."
 
 	descMeta = "Read, write, or delete META partition key/value pairs. " +
 		"action ∈ {read, write, delete}. write/delete require confirm=true. " +
@@ -166,171 +176,53 @@ var toolDescriptions = map[string]string{
 // AllowClusterWide and EnableGen can also gate registration. Do not depend on
 // the bool shape as stable API.
 func Register(server *mcp.Server, h *Handlers, readOnly bool) {
-	// All tools operate on a specific configured Talos cluster (closed world).
-	closedWorld := boolPtr(false)
-
-	// ── Read-only tools ──────────────────────────────────────────────────────
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:         "talos_resource_definitions",
-		Description:  descResourceDefinitions,
-		Annotations:  &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: closedWorld},
-		OutputSchema: ResourceDefinitionsOutputSchema(),
-	}, h.HandleResourceDefinitions)
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:         "talos_get",
-		Description:  descGet,
-		Annotations:  &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: closedWorld},
-		OutputSchema: GetResourceOutputSchema(),
-	}, h.HandleGetResource)
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:         "talos_version",
-		Description:  descVersion,
-		Annotations:  &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: closedWorld},
-		OutputSchema: VersionOutputSchema(),
-	}, h.HandleVersion)
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:         "talos_services",
-		Description:  descServices,
-		Annotations:  &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: closedWorld},
-		OutputSchema: ServicesOutputSchema(),
-	}, h.HandleServices)
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:         "talos_containers",
-		Description:  descContainers,
-		Annotations:  &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: closedWorld},
-		OutputSchema: ContainersOutputSchema(),
-	}, h.HandleContainers)
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:         "talos_processes",
-		Description:  descProcesses,
-		Annotations:  &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: closedWorld},
-		OutputSchema: ProcessesOutputSchema(),
-	}, h.HandleProcesses)
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:         "talos_health",
-		Description:  descHealth,
-		Annotations:  &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: closedWorld},
-		OutputSchema: HealthOutputSchema(),
-	}, h.HandleHealth)
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:         "talos_logs",
-		Description:  descLogs,
-		Annotations:  &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: closedWorld},
-		OutputSchema: LogsOutputSchema(),
-	}, h.HandleLogs)
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:         "talos_dmesg",
-		Description:  descDmesg,
-		Annotations:  &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: closedWorld},
-		OutputSchema: DmesgOutputSchema(),
-	}, h.HandleDmesg)
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:         "talos_events",
-		Description:  descEvents,
-		Annotations:  &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: closedWorld},
-		OutputSchema: EventsOutputSchema(),
-	}, h.HandleEvents)
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:         "talos_etcd",
-		Description:  descEtcd,
-		Annotations:  &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: closedWorld},
-		OutputSchema: EtcdOutputSchema(),
-	}, h.HandleEtcd)
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:         "talos_etcd_snapshot",
-		Description:  descEtcdSnapshot,
-		Annotations:  &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: closedWorld},
-		OutputSchema: EtcdSnapshotOutputSchema(),
-	}, h.HandleEtcdSnapshot)
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:         "talos_list_files",
-		Description:  descListFiles,
-		Annotations:  &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: closedWorld},
-		OutputSchema: ListFilesOutputSchema(),
-	}, h.HandleListFiles)
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:         "talos_read_file",
-		Description:  descReadFile,
-		Annotations:  &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: closedWorld},
-		OutputSchema: ReadFileOutputSchema(),
-	}, h.HandleReadFile)
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:         "talos_validate",
-		Description:  descValidate,
-		Annotations:  &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: closedWorld},
-		OutputSchema: ValidateOutputSchema(),
-	}, h.HandleValidate)
-
-	// ── Write / mutating tools ───────────────────────────────────────────────
-	// Skipped when TALOS_MCP_READ_ONLY=true.
+	addReadTool(server, "talos_resource_definitions", descResourceDefinitions, ResourceDefinitionsOutputSchema(), h.HandleResourceDefinitions)
+	addReadTool(server, "talos_get", descGet, GetResourceOutputSchema(), h.HandleGetResource)
+	addReadTool(server, "talos_version", descVersion, VersionOutputSchema(), h.HandleVersion)
+	addReadTool(server, "talos_services", descServices, ServicesOutputSchema(), h.HandleServices)
+	addReadTool(server, "talos_containers", descContainers, ContainersOutputSchema(), h.HandleContainers)
+	addReadTool(server, "talos_processes", descProcesses, ProcessesOutputSchema(), h.HandleProcesses)
+	addReadTool(server, "talos_health", descHealth, HealthOutputSchema(), h.HandleHealth)
+	addReadTool(server, "talos_logs", descLogs, LogsOutputSchema(), h.HandleLogs)
+	addReadTool(server, "talos_dmesg", descDmesg, DmesgOutputSchema(), h.HandleDmesg)
+	addReadTool(server, "talos_events", descEvents, EventsOutputSchema(), h.HandleEvents)
+	addReadTool(server, "talos_etcd", descEtcd, EtcdOutputSchema(), h.HandleEtcd)
+	addReadTool(server, "talos_etcd_snapshot", descEtcdSnapshot, EtcdSnapshotOutputSchema(), h.HandleEtcdSnapshot)
+	addReadTool(server, "talos_list_files", descListFiles, ListFilesOutputSchema(), h.HandleListFiles)
+	addReadTool(server, "talos_read_file", descReadFile, ReadFileOutputSchema(), h.HandleReadFile)
+	addReadTool(server, "talos_validate", descValidate, ValidateOutputSchema(), h.HandleValidate)
 
 	if !readOnly {
-		destructive := boolPtr(true)
-
-		mcp.AddTool(server, &mcp.Tool{
-			Name:        "talos_service_action",
-			Description: descServiceAction,
-			Annotations: &mcp.ToolAnnotations{DestructiveHint: destructive, OpenWorldHint: closedWorld},
-		}, h.HandleServiceAction)
-
-		mcp.AddTool(server, &mcp.Tool{
-			Name:        "talos_reboot",
-			Description: descReboot,
-			Annotations: &mcp.ToolAnnotations{DestructiveHint: destructive, OpenWorldHint: closedWorld},
-		}, h.HandleReboot)
-
-		mcp.AddTool(server, &mcp.Tool{
-			Name:        "talos_upgrade",
-			Description: descUpgrade,
-			Annotations: &mcp.ToolAnnotations{DestructiveHint: destructive, OpenWorldHint: closedWorld},
-		}, h.HandleUpgrade)
-
-		mcp.AddTool(server, &mcp.Tool{
-			Name:        "talos_rollback",
-			Description: descRollback,
-			Annotations: &mcp.ToolAnnotations{DestructiveHint: destructive, OpenWorldHint: closedWorld},
-		}, h.HandleRollback)
-
-		mcp.AddTool(server, &mcp.Tool{
-			Name:        "talos_patch_config",
-			Description: descPatchConfig,
-			Annotations: &mcp.ToolAnnotations{DestructiveHint: destructive, OpenWorldHint: closedWorld},
-		}, h.HandlePatchConfig)
-
-		mcp.AddTool(server, &mcp.Tool{
-			Name:        "talos_reset",
-			Description: descReset,
-			Annotations: &mcp.ToolAnnotations{DestructiveHint: destructive, OpenWorldHint: closedWorld},
-		}, h.HandleReset)
-
-		mcp.AddTool(server, &mcp.Tool{
-			Name:        "talos_apply_config",
-			Description: descApplyConfig,
-			Annotations: &mcp.ToolAnnotations{DestructiveHint: destructive, OpenWorldHint: closedWorld},
-		}, h.HandleApplyConfig)
-
-		mcp.AddTool(server, &mcp.Tool{
-			Name:        "talos_meta",
-			Description: descMeta,
-			Annotations: &mcp.ToolAnnotations{DestructiveHint: destructive, OpenWorldHint: closedWorld},
-		}, h.HandleMeta)
+		addMutatingTool(server, "talos_service_action", descServiceAction, h.HandleServiceAction)
+		addMutatingTool(server, "talos_reboot", descReboot, h.HandleReboot)
+		addMutatingTool(server, "talos_upgrade", descUpgrade, h.HandleUpgrade)
+		addMutatingTool(server, "talos_rollback", descRollback, h.HandleRollback)
+		addMutatingTool(server, "talos_patch_config", descPatchConfig, h.HandlePatchConfig)
+		addMutatingTool(server, "talos_reset", descReset, h.HandleReset)
+		addMutatingTool(server, "talos_apply_config", descApplyConfig, h.HandleApplyConfig)
+		addMutatingTool(server, "talos_meta", descMeta, h.HandleMeta)
 	}
 }
+
+func addReadTool[In, Out any](server *mcp.Server, name, description string, outputSchema *jsonschema.Schema, handler mcp.ToolHandlerFor[In, Out]) {
+	mcp.AddTool(server, &mcp.Tool{
+		Name:         name,
+		Description:  description,
+		Annotations:  &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: closedWorld()},
+		OutputSchema: outputSchema,
+	}, handler)
+}
+
+func addMutatingTool[In, Out any](server *mcp.Server, name, description string, handler mcp.ToolHandlerFor[In, Out]) {
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        name,
+		Description: description,
+		Annotations: &mcp.ToolAnnotations{DestructiveHint: boolPtr(true), OpenWorldHint: closedWorld()},
+	}, handler)
+}
+
+// closedWorld is the OpenWorldHint of every tool: each acts on one configured Talos cluster.
+func closedWorld() *bool { return boolPtr(false) }
 
 // boolPtr returns a pointer to a bool value.
 func boolPtr(b bool) *bool {

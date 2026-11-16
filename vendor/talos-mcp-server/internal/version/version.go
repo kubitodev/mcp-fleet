@@ -7,13 +7,13 @@ import (
 	"strings"
 )
 
-// MinSupported is the oldest Talos minor version where all 19 gRPC methods
+// MinSupported is the oldest Talos minor version where all gRPC methods
 // used by this server (including ResolveResourceKind) are confirmed stable.
 var MinSupported = TalosVersion{Major: 1, Minor: 9, Patch: 0}
 
 // MaxTested is the newest Talos minor series validated against the compiled
 // machinery SDK. The patch component is set to 255 to match any patch release.
-var MaxTested = TalosVersion{Major: 1, Minor: 13, Patch: 255}
+var MaxTested = TalosVersion{Major: 1, Minor: 14, Patch: 255}
 
 // TalosVersion holds a parsed Talos semver tag.
 type TalosVersion struct {
@@ -97,39 +97,7 @@ func (v TalosVersion) Less(other TalosVersion) bool {
 	return v.Patch < other.Patch
 }
 
-// Equal reports whether v equals other.
-func (v TalosVersion) Equal(other TalosVersion) bool {
-	return v.Major == other.Major && v.Minor == other.Minor && v.Patch == other.Patch
-}
-
 // InSupportedRange reports whether v falls within [MinSupported, MaxTested].
 func (v TalosVersion) InSupportedRange() bool {
 	return !v.Less(MinSupported) && !MaxTested.Less(v)
-}
-
-// ValidateUpgradePath checks that upgrading from current to target follows the
-// Talos upgrade rules:
-//   - Same major version
-//   - Target minor is current minor (patch-only upgrade) or current minor+1
-//   - Target must be strictly greater than current
-//
-// Returns a descriptive error when the path is invalid.
-func ValidateUpgradePath(current, target TalosVersion) error {
-	if target.Major != current.Major {
-		return fmt.Errorf("cross-major upgrades are not supported (current %s, target %s)", current, target)
-	}
-
-	if target.Less(current) || target.Equal(current) {
-		return fmt.Errorf("target version %s is not newer than current version %s", target, current)
-	}
-
-	minorDiff := target.Minor - current.Minor
-	if minorDiff > 1 {
-		return fmt.Errorf(
-			"skipping minor versions is not supported: upgrading from %s to %s skips %d minor version(s); upgrade one minor version at a time",
-			current, target, minorDiff-1,
-		)
-	}
-
-	return nil
 }

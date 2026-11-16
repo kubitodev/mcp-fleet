@@ -1,21 +1,24 @@
 ---
-weight: 4
+weight: 5
 title: "Limits"
 menu:
   docs:
     parent: "deployments"
-    weight: 4
+    weight: 5
     name: "Limits"
 tags:
   - metrics
+  - logs
+  - traces
   - cloud
   - enterprise
 ---
 
 > [!WARNING]
 > Hard limits described in this section only apply to the [VictoriaMetrics Capacity Tiers](https://docs.victoriametrics.com/victoriametrics-cloud/deployments/victoriametrics-tiers/).
-> In [VictoriaLogs Capacity Tiers](https://docs.victoriametrics.com/victoriametrics-cloud/deployments/victorialogs-tiers/)
-> only Access Token limits are enforced at the moment.
+> In [VictoriaLogs](https://docs.victoriametrics.com/victoriametrics-cloud/deployments/victorialogs-tiers/)
+> and [VictoriaTraces](https://docs.victoriametrics.com/victoriametrics-cloud/deployments/victoriatraces-tiers/)
+> Capacity Tiers only Access Token limits are enforced at the moment.
 
 Apart from the capacities per tier described in the [corresponding page](https://docs.victoriametrics.com/victoriametrics-cloud/deployments/victoriametrics-tiers/),
 VictoriaMetrics Cloud also enforces hard limits in order to ensure operations. Users can expect
@@ -32,6 +35,7 @@ is hitting a limit, a higher tier will be needed. Here are several examples of s
 - Max samples per series - default 30M (search.maxSamplesPerSeries)
 - Max samples per query - default to 1B (search.maxSamplesPerQuery)
 - Max search timeout - default 30 seconds
+- Max warning log lines per second - default 10 (loggerWarnsPerSecondLimit)
 
 For reference:
 - A comprehensive list of these limits may be found [here](https://docs.victoriametrics.com/victoriametrics/#resource-usage-limits)
@@ -80,6 +84,16 @@ Each deployment has a limit on the number of Access tokens that can be created, 
 <div>
 
 **VictoriaLogs deployments:**
+
+| Tier (CPUs) | Access token limit |
+|-------------|-------------------|
+| 1           | 20                |
+| 2           | 40                |
+| 3           | 60                |
+| 4           | 80                |
+| 5           | 100               |
+
+**VictoriaTraces deployments:**
 
 | Tier (CPUs) | Access token limit |
 |-------------|-------------------|

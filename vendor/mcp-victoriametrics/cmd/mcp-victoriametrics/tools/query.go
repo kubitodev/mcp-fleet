@@ -35,12 +35,7 @@ func toolQuery(c *config.Config) mcp.Tool {
 	if c.IsCluster() || c.IsCloud() {
 		options = append(
 			options,
-			mcp.WithString("tenant",
-				mcp.Title("Tenant name"),
-				mcp.Description("Name of the tenant for which the data will be displayed"),
-				mcp.DefaultString("0"),
-				mcp.Pattern(`^([0-9]+)(:[0-9]+)?$`),
-			),
+			withTenantParam("Name of the tenant for which the data will be displayed"),
 		)
 	}
 	options = append(
@@ -137,7 +132,7 @@ func toolQueryHandler(ctx context.Context, cfg *config.Config, tcr mcp.CallToolR
 	return GetTextBodyForRequest(req, cfg), nil
 }
 
-func RegisterToolQuery(s *server.MCPServer, c *config.Config) {
+func registerToolQuery(s *server.MCPServer, c *config.Config) {
 	if c.IsToolDisabled(toolNameQuery) {
 		return
 	}

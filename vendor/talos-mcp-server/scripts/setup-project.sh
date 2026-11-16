@@ -10,7 +10,7 @@ REPO="${REPO:-talos-mcp-server}"
 echo "==> Creating labels for ${OWNER}/${REPO}"
 
 # ---------------------------------------------------------------------------
-# Status labels (mutually exclusive)
+# Status labels (cardinality: AGENTS.md Label Rules)
 # ---------------------------------------------------------------------------
 gh label create "status: ready"          --color "0E8A16" --description "Triaged and ready for an agent to claim"            --repo "${OWNER}/${REPO}" --force
 gh label create "status: assigned"       --color "1D76DB" --description "Claimed by an agent, not yet started"               --repo "${OWNER}/${REPO}" --force
@@ -69,7 +69,7 @@ gh label create "origin: audit" --color "BFDADC" --description "Finding from a c
 gh label create "agent: claimed"       --color "006B75" --description "An agent has claimed this issue"    --repo "${OWNER}/${REPO}" --force
 gh label create "needs: decomposition" --color "D4C5F9" --description "Too large, needs sub-issues"       --repo "${OWNER}/${REPO}" --force
 gh label create "needs: clarification" --color "D4C5F9" --description "Requirements unclear"              --repo "${OWNER}/${REPO}" --force
-gh label create "needs: triage"        --color "D4C5F9" --description "Needs priority/area assignment"    --repo "${OWNER}/${REPO}" --force
+gh label create "needs: triage"        --color "D4C5F9" --description "Not yet triaged (AGENTS.md Triage)" --repo "${OWNER}/${REPO}" --force
 gh label create "duplicate"            --color "CFD3D7" --description "Duplicate issue"                   --repo "${OWNER}/${REPO}" --force
 gh label create "wontfix"              --color "CFD3D7" --description "Will not address"                  --repo "${OWNER}/${REPO}" --force
 

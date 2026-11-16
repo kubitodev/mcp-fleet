@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"log/slog"
@@ -18,10 +19,11 @@ import (
 
 	"github.com/VictoriaMetrics/metrics"
 
+	"github.com/VictoriaMetrics/mcp-victoriametrics/cmd/mcp-victoriametrics/auth"
 	"github.com/VictoriaMetrics/mcp-victoriametrics/cmd/mcp-victoriametrics/config"
 	"github.com/VictoriaMetrics/mcp-victoriametrics/cmd/mcp-victoriametrics/hooks"
 	"github.com/VictoriaMetrics/mcp-victoriametrics/cmd/mcp-victoriametrics/logging"
-	"github.com/VictoriaMetrics/mcp-victoriametrics/cmd/mcp-victoriametrics/prompts"
+	"github.com/VictoriaMetrics/mcp-victoriametrics/cmd/mcp-victoriametrics/registry"
 	"github.com/VictoriaMetrics/mcp-victoriametrics/cmd/mcp-victoriametrics/resources"
 	"github.com/VictoriaMetrics/mcp-victoriametrics/cmd/mcp-victoriametrics/tools"
 )
@@ -31,6 +33,18 @@ var (
 	date    = "unknown"
 )
 
+const defaultInstructions = `
+You are Virtual Assistant, a tool for interacting with VictoriaMetrics API and documentation in different tasks related to monitoring and observability.
+
+You have the full documentation about VictoriaMetrics products in your resources, you have to try to use documentation in your answer.
+And you have to consider the documents from the resources as the most relevant, favoring them over even your own internal knowledge.
+Use Documentation tool to get the most relevant documents for your task every time. Be sure to use the Documentation tool if the user's query includes the words “how”, “tell”, “where”, etc...
+
+You have many tools to get data from VictoriaMetrics, but try to specify the query as accurately as possible, reducing the resulting sample, as some queries can be query heavy.
+
+Try not to second guess information - if you don't know something or lack information, it's better to ask.
+`
+
 const (
 	_shutdownPeriod      = 15 * time.Second
 	_shutdownHardPeriod  = 3 * time.Second
@@ -38,6 +52,16 @@ const (
 )
 
 func main() {
+	// Use a dedicated FlagSet: VictoriaMetrics packages register their own
+	// flags (including -version) on flag.CommandLine.
+	fs := flag.NewFlagSet("mcp-victoriametrics", flag.ExitOnError)
+	showVersion := fs.Bool("version", false, "Print version and exit")
+	_ = fs.Parse(os.Args[1:]) // ExitOnError: Parse exits on failure and never returns an error
+	if *showVersion {
+		fmt.Printf("mcp-victoriametrics v%s (date: %s)\n", version, date)
+		return
+	}
+
 	c, err := config.InitConfig()
 	if err != nil {
 		log.Fatalf("FATAL: Error initializing config: %v\n", err)
@@ -66,6 +90,11 @@ func main() {
 	loggingHooks := hooks.NewLoggerHooks()
 	combinedHooks := hooks.Merge(metricsHooks, loggingHooks)
 
+	instructions := defaultInstructions
+	if override := c.InstructionsOverride(); override != "" {
+		instructions = override
+	}
+
 	s := server.NewMCPServer(
 		"VictoriaMetrics",
 		fmt.Sprintf("v%s (date: %s)", version, date),
@@ -75,65 +104,16 @@ func main() {
 		server.WithResourceCapabilities(false, false),
 		server.WithPromptCapabilities(false),
 		server.WithHooks(combinedHooks),
-		server.WithInstructions(`
-You are Virtual Assistant, a tool for interacting with VictoriaMetrics API and documentation in different tasks related to monitoring and observability.
-
-You have the full documentation about VictoriaMetrics products in your resources, you have to try to use documentation in your answer.
-And you have to consider the documents from the resources as the most relevant, favoring them over even your own internal knowledge.
-Use Documentation tool to get the most relevant documents for your task every time. Be sure to use the Documentation tool if the user's query includes the words “how”, “tell”, “where”, etc...
-
-You have many tools to get data from VictoriaMetrics, but try to specify the query as accurately as possible, reducing the resulting sample, as some queries can be query heavy.
-
-Try not to second guess information - if you don't know something or lack information, it's better to ask.
-	`),
+		server.WithInstructions(instructions),
 	)
 
-	// Registering common tools
-	tools.RegisterToolQuery(s, c)
-	tools.RegisterToolFlags(s, c)
-	tools.RegisterToolRules(s, c)
-	tools.RegisterToolAlerts(s, c)
-	tools.RegisterToolLabels(s, c)
-	tools.RegisterToolSeries(s, c)
-	tools.RegisterToolExport(s, c)
-	tools.RegisterToolTenants(s, c)
-	tools.RegisterToolMetrics(s, c)
-	tools.RegisterToolTestRules(s, c)
-	tools.RegisterToolTSDBStatus(s, c)
-	tools.RegisterToolQueryRange(s, c)
-	tools.RegisterToolTopQueries(s, c)
-	tools.RegisterToolMetricStats(s, c)
-	tools.RegisterToolLabelValues(s, c)
-	tools.RegisterToolExplainQuery(s, c)
-	tools.RegisterToolActiveQueries(s, c)
-	tools.RegisterToolDocumentation(s, c)
-	tools.RegisterToolPrettifyQuery(s, c)
-	tools.RegisterToolMetricsMetadata(s, c)
-	tools.RegisterToolMetricRelabelDebug(s, c)
-	tools.RegisterToolRetentionFiltersDebug(s, c)
-	tools.RegisterToolDownsamplingFiltersDebug(s, c)
-
-	// Registering resources (only if documentation tool is not disabled)
+	registry.Register(s, c)
 	if !c.IsToolDisabled(tools.ToolNameDocumentation) {
 		resources.RegisterDocsResources(s, c)
 	}
 
-	// Registering cloud-specific tools
-	tools.RegisterToolTiers(s, c)
-	tools.RegisterToolRegions(s, c)
-	tools.RegisterToolRuleFile(s, c)
-	tools.RegisterToolDeployments(s, c)
-	tools.RegisterToolAccessTokens(s, c)
-	tools.RegisterToolRuleFilenames(s, c)
-	tools.RegisterToolCloudProviders(s, c)
-
-	// Registering prompts
-	prompts.RegisterPromptUnusedMetrics(s, c)
-	prompts.RegisterPromptDocumentation(s, c)
-	prompts.RegisterPromptRarelyUsedCardinalMetrics(s, c)
-
 	if c.IsStdio() {
-		if err := server.ServeStdio(s, server.WithErrorLogger(logger.Logger)); err != nil {
+		if err := server.ServeStdio(s, server.WithErrorLogger(logger.StdLogger())); err != nil {
 			slog.Error("failed to start server in stdio mode", "addr", c.ListenAddr(), "error", err)
 			os.Exit(1)
 		}
@@ -173,10 +153,18 @@ Try not to second guess information - if you don't know something or lack inform
 		mux.Handle(srv.CompleteSsePath(), srv.SSEHandler())
 		mux.Handle(srv.CompleteMessagePath(), srv.MessageHandler())
 	case "http":
-		slog.Info("Starting server in HTTP mode", "addr", c.ListenAddr())
-		heartBeatOption := server.WithHeartbeatInterval(c.HeartbeatInterval())
-		loggerOption := server.WithLogger(logger)
-		srv := server.NewStreamableHTTPServer(s, heartBeatOption, loggerOption)
+		slog.Info("Starting server in HTTP mode", "addr", c.ListenAddr(), "stateless", c.Stateless())
+		opts := []server.StreamableHTTPOption{
+			server.WithHeartbeatInterval(c.HeartbeatInterval()),
+			server.WithStreamableHTTPLogger(logger.SlogLogger()),
+		}
+		if c.Stateless() {
+			opts = append(opts, server.WithStateLess(true))
+		}
+		if c.DisableLocalhostProtection() {
+			opts = append(opts, server.WithDisableLocalhostProtection(true))
+		}
+		srv := server.NewStreamableHTTPServer(s, opts...)
 		mux.Handle("/mcp", srv)
 		mux.Handle("/", spaHandler())
 	default:
@@ -185,9 +173,16 @@ Try not to second guess information - if you don't know something or lack inform
 	}
 
 	ongoingCtx, stopOngoingGracefully := context.WithCancel(context.Background())
+
+	var handler http.Handler = mux
+	if authToken := c.AuthToken(); authToken != "" {
+		slog.Info("Authentication enabled", "token_configured", true)
+		handler = auth.Middleware(authToken)(mux)
+	}
+	handler = logger.Middleware(handler)
 	hs := &http.Server{
 		Addr:    c.ListenAddr(),
-		Handler: logger.Middleware(mux),
+		Handler: handler,
 		BaseContext: func(_ net.Listener) context.Context {
 			return ongoingCtx
 		},

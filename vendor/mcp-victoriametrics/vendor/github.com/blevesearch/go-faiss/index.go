@@ -13,10 +13,17 @@ package faiss
 import "C"
 import (
 	"encoding/json"
-	"fmt"
+	"reflect"
 	"sort"
 	"unsafe"
 )
+
+var reflectStaticSizeFaissIndex uint64
+
+func init() {
+	var f faissIndex
+	reflectStaticSizeFaissIndex = uint64(reflect.TypeOf(f).Size())
+}
 
 // Index is a Faiss index.
 //
@@ -33,6 +40,15 @@ type Index interface {
 	// Ntotal returns the number of indexed vectors.
 	Ntotal() int64
 
+	// set the direct map type for IVF indexes.
+	// 0 for No Map
+	// 1 for Array
+	// 2 for Hash
+	SetDirectMap(maptype int) error
+
+	// set the number of probes for IVF indexes
+	SetNProbe(nprobe int32)
+
 	// MetricType returns the metric type of the index.
 	MetricType() int
 
@@ -48,6 +64,15 @@ type Index interface {
 	// Returns true if the index is an IVF index.
 	IsIVFIndex() bool
 
+	// Returns true if the index is a scalar quantization (SQ) index.
+	IsSQIndex() bool
+
+	// Returns true if the index has RaBitQ
+	HasRaBitQ() bool
+
+	// Returns the IVF parameters nprobe and nlist for IVF indexes.
+	IVFParams() (nprobe, nlist int)
+
 	// Applicable only to IVF indexes: Returns a slice where each index represents
 	// a cluster (list) ID and the value is the count of selected vectors belonging
 	// to that cluster. Only vectors specified by the given Selector are considered.
@@ -62,16 +87,18 @@ type Index interface {
 	// their vectors in chosen order (descending or ascending)
 	ObtainKCentroidCardinalitiesFromIVFIndex(limit int, descending bool) ([]uint64, [][]float32, error)
 
+	// fetch centroid count
+	Nlist() int
+
 	// Search queries the index with the vectors in x.
 	// Returns the IDs of the k nearest neighbors for each query vector and the
 	// corresponding distances.
 	Search(x []float32, k int64) (distances []float32, labels []int64, err error)
 
-	SearchWithoutIDs(x []float32, k int64, exclude Selector, params json.RawMessage) (distances []float32,
-		labels []int64, err error)
-
-	SearchWithIDs(x []float32, k int64, include Selector, params json.RawMessage) (distances []float32,
-		labels []int64, err error)
+	// SearchWithOptions performs a search with additional optional constraints.
+	// - Selector can be used to restrict the search to a subset of the indexed vectors based on their IDs.
+	// - params is a JSON object that can contain additional search parameters specific to the index type, such as IVF search parameters.
+	SearchWithOptions(x []float32, k int64, sel Selector, params json.RawMessage) (distances []float32, labels []int64, err error)
 
 	// Applicable only to IVF indexes: Search clusters whose IDs are in eligibleCentroidIDs
 	SearchClustersFromIVFIndex(eligibleCentroidIDs []int64, centroidDis []float32, centroidsToProbe int,
@@ -100,10 +127,19 @@ type Index interface {
 	// Close frees the memory used by the index.
 	Close()
 
-	// consults the C++ side to get the size of the index
+	// Size estimates the memory footprint of the index in bytes,
+	// if the underlying faiss index is memory-mapped and not fully loaded into memory.
 	Size() uint64
 
+	// cPtr returns a pointer to the underlying C index struct.
 	cPtr() *C.FaissIndex
+
+	// set the quantizers from a source index into this index, applicable only
+	// for IVF indexes
+	SetQuantizers(source Index) error
+
+	// CodeSize returns the size of the produced codes in bytes.
+	CodeSize() (uint64, error)
 }
 
 type faissIndex struct {
@@ -115,12 +151,24 @@ func (idx *faissIndex) cPtr() *C.FaissIndex {
 }
 
 func (idx *faissIndex) Size() uint64 {
-	size := C.faiss_Index_size(idx.idx)
-	return uint64(size)
+	rv := reflectStaticSizeFaissIndex
+	var size C.size_t
+	if code := C.faiss_Index_size(idx.idx, &size); code == 0 {
+		rv += uint64(size)
+	}
+	return rv
 }
 
 func (idx *faissIndex) D() int {
 	return int(C.faiss_Index_d(idx.idx))
+}
+
+func (idx *faissIndex) CodeSize() (uint64, error) {
+	var size C.size_t
+	if c := C.faiss_Index_sa_code_size(idx.idx, &size); c != 0 {
+		return 0, newFaissError(ErrInspectIndexFailed, getLastError(), int(c))
+	}
+	return uint64(size), nil
 }
 
 func (idx *faissIndex) IsTrained() bool {
@@ -138,7 +186,7 @@ func (idx *faissIndex) MetricType() int {
 func (idx *faissIndex) Train(x []float32) error {
 	n := len(x) / idx.D()
 	if c := C.faiss_Index_train(idx.idx, C.idx_t(n), (*C.float)(&x[0])); c != 0 {
-		return getLastError()
+		return newFaissError(ErrTrainFailed, getLastError(), int(c))
 	}
 	return nil
 }
@@ -146,7 +194,7 @@ func (idx *faissIndex) Train(x []float32) error {
 func (idx *faissIndex) Add(x []float32) error {
 	n := len(x) / idx.D()
 	if c := C.faiss_Index_add(idx.idx, C.idx_t(n), (*C.float)(&x[0])); c != 0 {
-		return getLastError()
+		return newFaissError(ErrAddFailed, getLastError(), int(c))
 	}
 	return nil
 }
@@ -155,7 +203,7 @@ func (idx *faissIndex) ObtainClusterVectorCountsFromIVFIndex(includedVectors Sel
 	// Applicable only to IVF indexes
 	ivfPtr := C.faiss_IndexIVF_cast(idx.cPtr())
 	if ivfPtr == nil {
-		return nil, fmt.Errorf("index is not of ivf type")
+		return nil, ErrNotIVFIndex
 	}
 	// Creating a slice to hold the count of vectors per cluster
 	// Since we have nlist clusters, we create a slice of size nlist
@@ -176,7 +224,7 @@ func (idx *faissIndex) ObtainClusterVectorCountsFromIVFIndex(includedVectors Sel
 		C.size_t(nlist),
 		params.sp,
 	); c != 0 {
-		return nil, getLastError()
+		return nil, newFaissError(ErrInspectIndexFailed, getLastError(), int(c))
 	}
 	return listCount, nil
 }
@@ -188,12 +236,16 @@ func (idx *faissIndex) IsIVFIndex() bool {
 	return true
 }
 
+func (idx *faissIndex) HasRaBitQ() bool {
+	return C.faiss_IndexIVF_has_RaBitQ(idx.idx) == 0
+}
+
 func (idx *faissIndex) ObtainClustersWithDistancesFromIVFIndex(x []float32, includedCentroids Selector, numCentroids int64) (
 	[]int64, []float32, error) {
 	// Applicable only to IVF indexes
 	ivfPtr := C.faiss_IndexIVF_cast(idx.cPtr())
 	if ivfPtr == nil {
-		return nil, nil, fmt.Errorf("index is not of ivf type")
+		return nil, nil, ErrNotIVFIndex
 	}
 	params, err := NewStandardSearchParams(includedCentroids)
 	if err != nil {
@@ -216,7 +268,7 @@ func (idx *faissIndex) ObtainClustersWithDistancesFromIVFIndex(x []float32, incl
 		(*C.idx_t)(&centroids[0]),
 		params.sp,
 	); c != 0 {
-		return nil, nil, getLastError()
+		return nil, nil, newFaissError(ErrSearchFailed, getLastError(), int(c))
 	}
 
 	return centroids, centroidDistances, nil
@@ -247,7 +299,7 @@ func (idx *faissIndex) ObtainKCentroidCardinalitiesFromIVFIndex(limit int, desce
 		nil,
 	)
 	if c != 0 {
-		return nil, nil, getLastError()
+		return nil, nil, newFaissError(ErrInspectIndexFailed, getLastError(), int(c))
 	}
 
 	topIndices := getIndicesOfKCentroidCardinalities(
@@ -287,18 +339,25 @@ func getIndicesOfKCentroidCardinalities(cardinalities []C.size_t, k int, descend
 
 	return indices[:k]
 }
+func (idx *faissIndex) Nlist() int {
+	ivfPtr := C.faiss_IndexIVF_cast(idx.cPtr())
+	if ivfPtr == nil {
+		return 0
+	}
+	return int(C.faiss_IndexIVF_nlist(idx.idx))
+}
 
 func (idx *faissIndex) SearchClustersFromIVFIndex(eligibleCentroidIDs []int64, centroidDis []float32, centroidsToProbe int,
 	x []float32, k int64, include Selector, params json.RawMessage) ([]float32, []int64, error) {
 	// Applicable only to IVF indexes
 	ivfPtr := C.faiss_IndexIVF_cast(idx.cPtr())
 	if ivfPtr == nil {
-		return nil, nil, fmt.Errorf("index is not of ivf type")
+		return nil, nil, ErrNotIVFIndex
 	}
 	// If no include selector is provided, we have no results to return.
 	// return an error indicating that the SearchClustersFromIVFIndex requires a valid selector.
 	if include == nil {
-		return nil, nil, fmt.Errorf("SearchClustersFromIVFIndex requires a valid include selector")
+		return nil, nil, ErrSelectorNil
 	}
 	// create a temporary search params object to set nprobe, this will override
 	// the nprobe and the nlist set at index time, this will allow the search to
@@ -342,7 +401,7 @@ func (idx *faissIndex) SearchClustersFromIVFIndex(eligibleCentroidIDs []int64, c
 		(C.int)(0),
 		searchParams.sp,
 	); c != 0 {
-		return nil, nil, getLastError()
+		return nil, nil, newFaissError(ErrSearchFailed, getLastError(), int(c))
 	}
 
 	return distances, labels, nil
@@ -356,11 +415,14 @@ func (idx *faissIndex) AddWithIDs(x []float32, xids []int64) error {
 		(*C.float)(&x[0]),
 		(*C.idx_t)(&xids[0]),
 	); c != 0 {
-		return getLastError()
+		return newFaissError(ErrAddFailed, getLastError(), int(c))
 	}
 	return nil
 }
 
+// Always use SearchWithOptions for indexes involving RaBitQ, as
+// simple Search is highly unoptimized for RaBitQ indexes and
+// will not leverage the quantizer for search.
 func (idx *faissIndex) Search(x []float32, k int64) (
 	distances []float32, labels []int64, err error,
 ) {
@@ -375,52 +437,17 @@ func (idx *faissIndex) Search(x []float32, k int64) (
 		(*C.float)(&distances[0]),
 		(*C.idx_t)(&labels[0]),
 	); c != 0 {
-		err = getLastError()
+		err = newFaissError(ErrSearchFailed, getLastError(), int(c))
 	}
 
 	return
 }
 
-// SearchWithoutIDs performs a search excluding the IDs specified in the exclude selector.
-func (idx *faissIndex) SearchWithoutIDs(x []float32, k int64, exclude Selector, params json.RawMessage) (
-	distances []float32, labels []int64, err error,
-) {
-	// If no exclude selector and no additional parameters are provided,
-	// perform a standard search.
-	if params == nil && exclude == nil {
+func (idx *faissIndex) SearchWithOptions(x []float32, k int64, sel Selector, params json.RawMessage) ([]float32, []int64, error) {
+	if sel == nil && params == nil && !idx.HasRaBitQ() {
 		return idx.Search(x, k)
 	}
-	// Create search parameters with the exclude selector.
-	searchParams, err := NewSearchParams(idx, params, exclude, nil)
-	if err != nil {
-		return nil, nil, err
-	}
-	// cleanup the searchParams after use
-	defer searchParams.Delete()
-	// Perform the search with the specified parameters.
-	distances, labels, err = idx.searchWithParams(x, k, searchParams.sp)
-	return
-}
-
-// SearchWithIDs performs a search including only the IDs specified in the include selector.
-func (idx *faissIndex) SearchWithIDs(x []float32, k int64, include Selector, params json.RawMessage) (
-	distances []float32, labels []int64, err error,
-) {
-	// If no include selector is provided, we have no results to return.
-	// return an error indicating that the SearchWithIDs requires a valid selector.
-	if include == nil {
-		return nil, nil, fmt.Errorf("SearchWithIDs requires a valid include selector")
-	}
-	// Create search parameters with the include selector.
-	searchParams, err := NewSearchParams(idx, params, include, nil)
-	if err != nil {
-		return nil, nil, err
-	}
-	// cleanup the searchParams after use
-	defer searchParams.Delete()
-	// Perform the search with the specified parameters.
-	distances, labels, err = idx.searchWithParams(x, k, searchParams.sp)
-	return
+	return idx.searchWithOptions(x, k, sel, params)
 }
 
 func (idx *faissIndex) Reconstruct(key int64) (recons []float32, err error) {
@@ -430,7 +457,7 @@ func (idx *faissIndex) Reconstruct(key int64) (recons []float32, err error) {
 		C.idx_t(key),
 		(*C.float)(&rv[0]),
 	); c != 0 {
-		err = getLastError()
+		err = newFaissError(ErrReconstructFailed, getLastError(), int(c))
 	}
 
 	return rv, err
@@ -445,31 +472,26 @@ func (idx *faissIndex) ReconstructBatch(keys []int64, recons []float32) ([]float
 		(*C.idx_t)(&keys[0]),
 		(*C.float)(&recons[0]),
 	); c != 0 {
-		err = getLastError()
+		err = newFaissError(ErrReconstructFailed, getLastError(), int(c))
 	}
 
 	return recons, err
 }
 
-func (i *IndexImpl) MergeFrom(other Index, add_id int64) error {
-	if impl, ok := other.(*IndexImpl); ok {
-		return i.Index.MergeFrom(impl.Index, add_id)
-	}
-	return fmt.Errorf("merge not support")
-}
-
 func (idx *faissIndex) MergeFrom(other Index, add_id int64) (err error) {
-	otherIdx, ok := other.(*faissIndex)
-	if !ok {
-		return fmt.Errorf("merge api not supported")
+	// currrently we support the mergeFrom API only for IVF and SQ indexes
+	// todo: support on Flat index as well
+	if !(idx.IsIVFIndex() && other.IsIVFIndex()) &&
+		!(idx.IsSQIndex() && other.IsSQIndex()) {
+		return ErrMergeFromNotSupported
 	}
 
 	if c := C.faiss_Index_merge_from(
-		idx.idx,
-		otherIdx.idx,
+		idx.cPtr(),
+		other.cPtr(),
 		(C.idx_t)(add_id),
 	); c != 0 {
-		err = getLastError()
+		err = newFaissError(ErrMergeFromFailed, getLastError(), int(c))
 	}
 
 	return err
@@ -481,7 +503,7 @@ func (idx *faissIndex) RangeSearch(x []float32, radius float32) (
 	n := len(x) / idx.D()
 	var rsr *C.FaissRangeSearchResult
 	if c := C.faiss_RangeSearchResult_new(&rsr, C.idx_t(n)); c != 0 {
-		return nil, getLastError()
+		return nil, newFaissError(ErrSearchFailed, getLastError(), int(c))
 	}
 	if c := C.faiss_Index_range_search(
 		idx.idx,
@@ -490,7 +512,7 @@ func (idx *faissIndex) RangeSearch(x []float32, radius float32) (
 		C.float(radius),
 		rsr,
 	); c != 0 {
-		return nil, getLastError()
+		return nil, newFaissError(ErrSearchFailed, getLastError(), int(c))
 	}
 	return &RangeSearchResult{rsr}, nil
 }
@@ -499,7 +521,7 @@ func (idx *faissIndex) DistCompute(queryData []float32, ids []int64) ([]float32,
 	distances := make([]float32, len(ids))
 	if c := C.faiss_Index_dist_compute(idx.idx, (*C.float)(&queryData[0]),
 		(*C.idx_t)(&ids[0]), (C.size_t)(len(ids)), (*C.float)(&distances[0])); c != 0 {
-		return nil, getLastError()
+		return nil, newFaissError(ErrSearchFailed, getLastError(), int(c))
 	}
 
 	return distances, nil
@@ -507,7 +529,7 @@ func (idx *faissIndex) DistCompute(queryData []float32, ids []int64) ([]float32,
 
 func (idx *faissIndex) Reset() error {
 	if c := C.faiss_Index_reset(idx.idx); c != 0 {
-		return getLastError()
+		return newFaissError(ErrResetIndexFailed, getLastError(), int(c))
 	}
 	return nil
 }
@@ -515,7 +537,7 @@ func (idx *faissIndex) Reset() error {
 func (idx *faissIndex) RemoveIDs(sel *IDSelector) (int, error) {
 	var nRemoved C.size_t
 	if c := C.faiss_Index_remove_ids(idx.idx, sel.sel, &nRemoved); c != 0 {
-		return 0, getLastError()
+		return 0, newFaissError(ErrRemoveIDsFailed, getLastError(), int(c))
 	}
 	return int(nRemoved), nil
 }
@@ -524,26 +546,30 @@ func (idx *faissIndex) Close() {
 	C.faiss_Index_free(idx.idx)
 }
 
-func (idx *faissIndex) searchWithParams(x []float32, k int64, searchParams *C.FaissSearchParameters) (
-	distances []float32, labels []int64, err error,
-) {
+func (idx *faissIndex) searchWithOptions(x []float32, k int64, sel Selector, params json.RawMessage) ([]float32, []int64, error) {
+	// Build a search params object to contain either the selector, the additional params, or both.
+	searchParams, err := NewSearchParams(idx, params, sel, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer searchParams.Delete()
+
 	n := len(x) / idx.D()
-	distances = make([]float32, int64(n)*k)
-	labels = make([]int64, int64(n)*k)
+	distances := make([]float32, int64(n)*k)
+	labels := make([]int64, int64(n)*k)
 
 	if c := C.faiss_Index_search_with_params(
 		idx.idx,
 		C.idx_t(n),
 		(*C.float)(&x[0]),
 		C.idx_t(k),
-		searchParams,
+		searchParams.sp,
 		(*C.float)(&distances[0]),
 		(*C.idx_t)(&labels[0]),
 	); c != 0 {
-		err = getLastError()
+		return nil, nil, newFaissError(ErrSearchFailed, getLastError(), int(c))
 	}
-
-	return
+	return distances, labels, nil
 }
 
 // -----------------------------------------------------------------------------
@@ -598,7 +624,7 @@ func IndexFactory(d int, description string, metric int) (*IndexImpl, error) {
 	var idx faissIndex
 	c := C.faiss_index_factory(&idx.idx, C.int(d), cdesc, C.FaissMetricType(metric))
 	if c != 0 {
-		return nil, getLastError()
+		return nil, newFaissError(ErrCreateIndexFailed, getLastError(), int(c))
 	}
 	return &IndexImpl{&idx}, nil
 }

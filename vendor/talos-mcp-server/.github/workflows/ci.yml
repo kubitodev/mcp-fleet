@@ -4,14 +4,16 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "30 3 * * 1" # weekly Monday 03:30 UTC: govulncheck sees new advisories without a PR
 
 permissions:
   contents: read
 
 jobs:
   # Detect which files changed — pull_request only.
-  # On push to main, always run full CI (paths-filter uses git diff HEAD~1 on push,
-  # which is inaccurate for rebase merges; full CI on main is the safer default).
+  # On push to main and on schedule, always run full CI (paths-filter uses git diff HEAD~1
+  # on push, which is inaccurate for rebase merges; full CI on main is the safer default).
   changes:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -20,13 +22,13 @@ jobs:
     outputs:
       go: ${{ steps.filter.outputs.go }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
       - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
         id: filter
         with:
           filters: |
             go:
-              - '*.go'
+              - '**/*.go'
               - 'cmd/**'
               - 'internal/**'
               - 'go.mod'
@@ -34,32 +36,37 @@ jobs:
               - 'Makefile'
               - '.goreleaser.yaml'
               - '.github/workflows/ci.yml'
+              - '.go-arch-lint.yml'
+              - '.golangci.yml'
+              - 'mise.toml'
+              - 'mise.lock'
 
   lint:
     needs: changes
-    # Push to main: always run. Pull request: only when Go-relevant files changed.
+    # Push to main / schedule: always run. Pull request: only when Go-relevant files changed.
+    # The status functions replace the implicit success(), which skips this job whenever
+    # 'changes' is skipped, i.e. on every non-PR run. Same for verify, test and build.
     # NOTE: keep Go path list in sync with the 'changes' job and auto-tag.yml.
+    # The 'go' filter intentionally carries CI-only entries that auto-tag.yml omits.
     if: >-
-      github.event_name == 'push' ||
-      needs.changes.outputs.go == 'true'
+      !cancelled() && !failure() &&
+      (github.event_name != 'pull_request' || needs.changes.outputs.go == 'true')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v4
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: jdx/mise-action@6be3c7ed4c21d4f76b208d351d95aac273ebb76d # v5.2.4
         with:
-          go-version-file: go.mod
-      - uses: golangci/golangci-lint-action@82606bf257cbaff209d206a39f5134f0cfbfd2ee # v9
-        with:
-          version: v2.11
+          version: 2026.11.5
+      - run: make fmt vet lint arch-lint
 
   verify:
     needs: changes
     if: >-
-      github.event_name == 'push' ||
-      needs.changes.outputs.go == 'true'
+      !cancelled() && !failure() &&
+      (github.event_name != 'pull_request' || needs.changes.outputs.go == 'true')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v5
         with:
           go-version-file: go.mod
@@ -70,11 +77,11 @@ jobs:
   test:
     needs: changes
     if: >-
-      github.event_name == 'push' ||
-      needs.changes.outputs.go == 'true'
+      !cancelled() && !failure() &&
+      (github.event_name != 'pull_request' || needs.changes.outputs.go == 'true')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v5
         with:
           go-version-file: go.mod
@@ -89,11 +96,11 @@ jobs:
   build:
     needs: changes
     if: >-
-      github.event_name == 'push' ||
-      needs.changes.outputs.go == 'true'
+      !cancelled() && !failure() &&
+      (github.event_name != 'pull_request' || needs.changes.outputs.go == 'true')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v5
         with:
           go-version-file: go.mod
@@ -102,15 +109,17 @@ jobs:
   validate-config:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
       - name: Validate .claude/settings.json
         run: jq empty .claude/settings.json
+      - name: Test reviewer write guard
+        run: bash .claude/hooks/review-write-guard.test.sh
 
   # Single required status check: passes when all CI jobs pass or are legitimately skipped.
   # Skipped = no Go-relevant files changed on this PR.
   merge-guard:
     if: always() && !cancelled()
-    needs: [lint, test, build, verify, validate-config]
+    needs: [changes, lint, test, build, verify, validate-config]
     runs-on: ubuntu-latest
     steps:
       - name: Fail on CI failure or cancellation

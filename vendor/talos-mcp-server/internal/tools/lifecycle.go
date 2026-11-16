@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -15,18 +16,20 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
 	talosclient "github.com/siderolabs/talos/pkg/machinery/client"
+	"github.com/siderolabs/talos/pkg/machinery/compatibility"
 	"github.com/siderolabs/talos/pkg/machinery/config/configpatcher"
 	talosconfig "github.com/siderolabs/talos/pkg/machinery/resources/config"
 	"go.yaml.in/yaml/v4"
+	"google.golang.org/grpc/codes"
 
 	"github.com/Nosmoht/talos-mcp-server/internal/talos"
 	"github.com/Nosmoht/talos-mcp-server/internal/version"
 )
 
 const (
-	defaultRebootTimeout  = 5 * time.Minute
-	rebootProbeInterval   = 2 * time.Second
-	comebackProbeInterval = 3 * time.Second
+	defaultRebootTimeout = 5 * time.Minute
+	rebootProbeInterval  = 3 * time.Second
+	rebootProbeTimeout   = 5 * time.Second
 
 	// maxConfigFileSize caps the size of a config file read by readConfigFile.
 	// A machine config should never exceed 1 MiB in practice.
@@ -53,33 +56,31 @@ func (h *Handlers) HandleServiceAction(ctx context.Context, _ *mcp.CallToolReque
 		return nil, nil, fmt.Errorf("service_name is required")
 	}
 
-	var (
-		resp any
-		err  error
-	)
-
-	ctx, err = talos.WithNodes(ctx, args.Nodes, h.AllowedNodes)
+	targets, err := talos.CheckTargets(args.Nodes, h.AllowedNodes)
 	if err != nil {
 		return nil, nil, err
 	}
 
+	var call func(context.Context) (any, error)
+
 	switch args.Action {
 	case "start":
-		resp, err = h.Client.ServiceStart(ctx, args.ServiceName)
+		call = func(c context.Context) (any, error) { return h.Client.ServiceStart(c, args.ServiceName) }
 	case "stop":
-		resp, err = h.Client.ServiceStop(ctx, args.ServiceName)
+		call = func(c context.Context) (any, error) { return h.Client.ServiceStop(c, args.ServiceName) }
 	case "restart":
-		resp, err = h.Client.ServiceRestart(ctx, args.ServiceName)
+		call = func(c context.Context) (any, error) { return h.Client.ServiceRestart(c, args.ServiceName) }
 	default:
 		return nil, nil, fmt.Errorf("unknown action %q: must be 'start', 'stop', or 'restart'", args.Action)
 	}
 
-	if err != nil {
+	rs, out := talos.FanOut(ctx, targets, call)
+	if _, err := out.FailClosed(); err != nil {
 		h.mcpLogError("talos_service_action", err)
 		return nil, nil, fmt.Errorf("service %s %q: %w", args.Action, args.ServiceName, err)
 	}
 
-	return jsonResult(resp)
+	return unaryResult(rs)
 }
 
 // RebootArgs defines input for talos_reboot.
@@ -127,70 +128,105 @@ func (h *Handlers) HandleReboot(ctx context.Context, req *mcp.CallToolRequest, a
 		return nil, nil, fmt.Errorf("reboot refused: nodes must be explicitly specified")
 	}
 
-	var opts []talosclient.RebootMode
-
-	switch args.Mode {
-	case "powercycle":
-		opts = append(opts, talosclient.WithPowerCycle)
-	case "force":
-		opts = append(opts, talosclient.WithForce)
-	case "default", "":
-		// no extra opts
-	default:
-		return nil, nil, fmt.Errorf("unknown mode %q: must be 'default', 'powercycle', or 'force'", args.Mode)
-	}
-
-	// Validate timeout early — before issuing the reboot — so a typo does not
-	// trigger a reboot that we then cannot track.
-	if args.Wait {
-		if _, err := parseRebootTimeout(args.Timeout); err != nil {
-			return nil, nil, err
-		}
-	}
-
-	nodeCtx, err := talos.WithNodes(ctx, args.Nodes, h.AllowedNodes)
+	mode, err := parseRebootMode(args.Mode)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	if !args.Wait {
-		if err := h.Client.Reboot(nodeCtx, opts...); err != nil {
-			h.mcpLogError("talos_reboot", err)
-			return nil, nil, fmt.Errorf("reboot: %w", err)
+	// Validate timeout early — before issuing the reboot — so a typo does not
+	// trigger a reboot that we then cannot track.
+	var timeout time.Duration
+	if args.Wait {
+		if timeout, err = parseRebootTimeout(args.Timeout); err != nil {
+			return nil, nil, err
 		}
-
-		notifyProgress(ctx, req, "Reboot initiated", 1, 1)
-
-		return textResult(fmt.Sprintf("Reboot initiated for nodes: %v", args.Nodes)), nil, nil
 	}
 
-	// wait=true path -----------------------------------------------------------
+	targets, err := talos.CheckTargets(args.Nodes, h.AllowedNodes)
+	if err != nil {
+		return nil, nil, err
+	}
 
-	timeout, _ := parseRebootTimeout(args.Timeout) // already validated above
+	reboot := func() error {
+		_, out := talos.FanOut(ctx, targets, func(c context.Context) (struct{}, error) {
+			return struct{}{}, h.Client.RebootNodes(c, mode)
+		})
+		if _, err := out.FailClosed(); err != nil {
+			h.mcpLogError("talos_reboot", err)
+			return fmt.Errorf("reboot: %w", err)
+		}
+		return nil
+	}
 
+	if args.Wait {
+		return h.rebootAndWait(ctx, req, args.Nodes, timeout, reboot)
+	}
+
+	if err := reboot(); err != nil {
+		return nil, nil, err
+	}
+
+	notifyProgress(ctx, req, "Reboot initiated", 1, 1)
+
+	return textResult(fmt.Sprintf("Reboot initiated for nodes: %v", args.Nodes)), nil, nil
+}
+
+func (h *Handlers) rebootAndWait(ctx context.Context, req *mcp.CallToolRequest, nodes []string, timeout time.Duration, reboot func() error) (*mcp.CallToolResult, any, error) {
 	notifyProgress(ctx, req, "Reading pre-reboot boot IDs", 1, 4)
 
 	// Read boot IDs before issuing the reboot so we can verify they changed.
-	preBootIDs := make(map[string]string, len(args.Nodes))
-
-	for _, node := range args.Nodes {
-		id, err := h.readBootID(ctx, node)
-		if err != nil {
-			return nil, nil, fmt.Errorf("pre-reboot boot ID for %s: %w", node, err)
-		}
-
-		preBootIDs[node] = id
+	preBootIDs, err := h.readBootIDs(ctx, nodes)
+	if err != nil {
+		return nil, nil, err
 	}
 
-	notifyProgress(ctx, req, fmt.Sprintf("Rebooting %d node(s)", len(args.Nodes)), 2, 4)
+	notifyProgress(ctx, req, fmt.Sprintf("Rebooting %d node(s)", len(nodes)), 2, 4)
 
-	if err := h.Client.Reboot(nodeCtx, opts...); err != nil {
-		h.mcpLogError("talos_reboot", err)
-		return nil, nil, fmt.Errorf("reboot: %w", err)
+	if err := reboot(); err != nil {
+		return nil, nil, err
 	}
 
 	notifyProgress(ctx, req, "Waiting for node(s) to complete reboot", 3, 4)
 
+	results, err := h.waitForReboots(ctx, req, preBootIDs, nodes, timeout)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	notifyProgress(ctx, req, "All node(s) rebooted successfully", 4, 4)
+
+	return jsonResult(results)
+}
+
+func parseRebootMode(mode string) (machineapi.RebootRequest_Mode, error) {
+	switch mode {
+	case "powercycle":
+		return machineapi.RebootRequest_POWERCYCLE, nil
+	case "force":
+		return machineapi.RebootRequest_FORCE, nil
+	case "default", "":
+		return machineapi.RebootRequest_DEFAULT, nil
+	default:
+		return 0, fmt.Errorf("unknown mode %q: must be 'default', 'powercycle', or 'force'", mode)
+	}
+}
+
+func (h *Handlers) readBootIDs(ctx context.Context, nodes []string) (map[string]string, error) {
+	ids := make(map[string]string, len(nodes))
+
+	for _, node := range nodes {
+		id, err := h.readBootID(ctx, node)
+		if err != nil {
+			return nil, fmt.Errorf("pre-reboot boot ID for %s: %w", node, err)
+		}
+
+		ids[node] = id
+	}
+
+	return ids, nil
+}
+
+func (h *Handlers) waitForReboots(ctx context.Context, req *mcp.CallToolRequest, preBootIDs map[string]string, nodes []string, timeout time.Duration) ([]rebootResult, error) {
 	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -201,14 +237,13 @@ func (h *Handlers) HandleReboot(ctx context.Context, req *mcp.CallToolRequest, a
 		err    error
 	}
 
-	outCh := make(chan nodeOutcome, len(args.Nodes))
+	outCh := make(chan nodeOutcome, len(nodes))
 
-	for _, node := range args.Nodes {
-		node := node
+	for _, node := range nodes {
 		preID := preBootIDs[node]
 
 		go func() {
-			res, err := h.waitForNodeReboot(timeoutCtx, req, node, preID, startTime)
+			res, err := h.waitForNodeReboot(timeoutCtx, req, node, preID, startTime, rebootProbeInterval)
 			outCh <- nodeOutcome{result: res, err: err}
 		}()
 	}
@@ -218,7 +253,7 @@ func (h *Handlers) HandleReboot(ctx context.Context, req *mcp.CallToolRequest, a
 		errs    []string
 	)
 
-	for range args.Nodes {
+	for range nodes {
 		o := <-outCh
 		if o.err != nil {
 			errs = append(errs, o.err.Error())
@@ -227,26 +262,23 @@ func (h *Handlers) HandleReboot(ctx context.Context, req *mcp.CallToolRequest, a
 		}
 	}
 
-	if len(errs) > 0 {
-		combined := strings.Join(errs, "; ")
-		if len(results) > 0 {
-			// Some nodes succeeded — include partial results in the error message.
-			partial, _ := json.Marshal(results)
-			return nil, nil, fmt.Errorf("wait failed for %d/%d node(s): %s (succeeded: %s)", len(errs), len(args.Nodes), combined, partial)
-		}
-
-		return nil, nil, fmt.Errorf("wait failed for all nodes: %s", combined)
+	if len(errs) == 0 {
+		return results, nil
 	}
 
-	notifyProgress(ctx, req, "All node(s) rebooted successfully", 4, 4)
+	combined := strings.Join(errs, "; ")
+	if len(results) > 0 {
+		partial, _ := json.Marshal(results)
+		return nil, fmt.Errorf("wait failed for %d/%d node(s): %s (succeeded: %s)", len(errs), len(nodes), combined, partial)
+	}
 
-	return jsonResult(results)
+	return nil, fmt.Errorf("wait failed for all nodes: %s", combined)
 }
 
 // readBootID reads /proc/sys/kernel/random/boot_id from the given node.
 func (h *Handlers) readBootID(ctx context.Context, node string) (string, error) {
 	// nil allowlist: nodes were already validated in HandleReboot before the reboot was issued.
-	nodeCtx, err := talos.WithNodes(ctx, []string{node}, nil)
+	nodeCtx, err := talos.WithSingleNode(ctx, []string{node}, nil)
 	if err != nil {
 		return "", err
 	}
@@ -263,77 +295,77 @@ func (h *Handlers) readBootID(ctx context.Context, node string) (string, error) 
 		return "", fmt.Errorf("read boot_id content: %w", err)
 	}
 
-	return strings.TrimSpace(string(data)), nil
+	// machined's Read returns nil once its stream context is cancelled, so a read
+	// cut short by a shutdown can end without an error and with partial data.
+	id := strings.TrimSpace(string(data))
+	if len(id) != bootIDLength {
+		return "", fmt.Errorf("read boot_id: %w: got %q", errIncompleteBootID, id)
+	}
+
+	return id, nil
 }
 
-// waitForNodeReboot polls until the given node has completed its reboot.
-// It returns an error if the context deadline is exceeded or if the boot ID
-// did not change (indicating no actual reboot occurred).
-func (h *Handlers) waitForNodeReboot(ctx context.Context, req *mcp.CallToolRequest, node, preBootID string, startTime time.Time) (*rebootResult, error) {
-	// Phase 1: wait for the node to become unreachable (reboot starting).
-	notifyProgress(ctx, req, fmt.Sprintf("Node %s: waiting for reboot to start...", node), 0, 0)
+// bootIDLength is the length of the UUID text in /proc/sys/kernel/random/boot_id.
+const bootIDLength = 36
+
+var errIncompleteBootID = errors.New("incomplete boot ID")
+
+// waitForNodeReboot polls the node's boot ID until it differs from preBootID,
+// the same post check talosctl runs after a reboot.
+func (h *Handlers) waitForNodeReboot(ctx context.Context, req *mcp.CallToolRequest, node, preBootID string, startTime time.Time, interval time.Duration) (*rebootResult, error) {
+	notifyProgress(ctx, req, fmt.Sprintf("Node %s: waiting for a new boot ID...", node), 0, 0)
 
 	for {
-		callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		_, vErr := h.Client.GetNodeVersion(callCtx, node)
+		callCtx, cancel := context.WithTimeout(ctx, rebootProbeTimeout)
+		bootID, err := h.readBootID(callCtx, node)
 		cancel()
 
-		if vErr != nil {
-			// Node is unreachable — reboot has started.
-			break
+		if err == nil && bootID != preBootID {
+			return &rebootResult{
+				Node:      node,
+				OldBootID: preBootID,
+				NewBootID: bootID,
+				Duration:  time.Since(startTime).Round(time.Second).String(),
+				Status:    "rebooted successfully",
+			}, nil
+		}
+
+		if err != nil && !isRebootTransient(err) {
+			return nil, fmt.Errorf("node %s: %w", node, err)
 		}
 
 		select {
 		case <-ctx.Done():
-			return nil, fmt.Errorf("timed out waiting for node to go down: %w", ctx.Err())
-		case <-time.After(rebootProbeInterval):
+			reason := "timed out"
+			if errors.Is(ctx.Err(), context.Canceled) {
+				reason = "wait cancelled"
+			}
+
+			if err != nil {
+				return nil, fmt.Errorf("node %s: %s waiting for the node to come back: %w", node, reason, err)
+			}
+
+			return nil, fmt.Errorf("node %s: %s, boot ID did not change (%s) — reboot may not have occurred", node, reason, preBootID)
+		case <-time.After(interval):
 		}
 	}
+}
 
-	// Phase 2: wait for the node to become reachable again (reboot complete).
-	notifyProgress(ctx, req, fmt.Sprintf("Node %s: rebooting, waiting for node to come back...", node), 0, 0)
-
-	for {
-		callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		_, vErr := h.Client.GetNodeVersion(callCtx, node)
-		cancel()
-
-		if vErr == nil {
-			break
-		}
-
-		select {
-		case <-ctx.Done():
-			return nil, fmt.Errorf("timed out waiting for node to come back: %w", ctx.Err())
-		case <-time.After(comebackProbeInterval):
-		}
+// isRebootTransient reports whether err is one talosctl's post check retries
+// (cmd/talosctl/pkg/talos/action/node.go, unexported there), a timed-out probe,
+// or a boot ID read cut short by the shutdown.
+func isRebootTransient(err error) bool {
+	if errors.Is(err, io.EOF) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) ||
+		errors.Is(err, errIncompleteBootID) {
+		return true
 	}
 
-	// Phase 3: verify boot ID changed to confirm an actual reboot occurred.
-	newBootID, err := h.readBootID(ctx, node)
-	if err != nil {
-		// Boot ID read failure after a successful Version() call is unexpected but
-		// not fatal — report it in the result rather than failing the whole wait.
-		return &rebootResult{
-			Node:      node,
-			OldBootID: preBootID,
-			NewBootID: "<unreadable: " + err.Error() + ">",
-			Duration:  time.Since(startTime).Round(time.Second).String(),
-			Status:    "rebooted (boot ID verification failed)",
-		}, nil
+	switch talosclient.StatusCode(err) { //nolint:exhaustive // every other code ends the wait
+	case codes.Unavailable, codes.Canceled, codes.DeadlineExceeded:
+		return true
+	default:
+		return false
 	}
-
-	if newBootID == preBootID {
-		return nil, fmt.Errorf("node responded but boot ID did not change (%s) — reboot may not have occurred", preBootID)
-	}
-
-	return &rebootResult{
-		Node:      node,
-		OldBootID: preBootID,
-		NewBootID: newBootID,
-		Duration:  time.Since(startTime).Round(time.Second).String(),
-		Status:    "rebooted successfully",
-	}, nil
 }
 
 // UpgradeArgs defines input for talos_upgrade.
@@ -363,58 +395,34 @@ func (h *Handlers) HandleUpgrade(ctx context.Context, req *mcp.CallToolRequest, 
 		return nil, nil, fmt.Errorf("upgrade refused: image must be specified")
 	}
 
-	// Validate reboot_mode before touching the gRPC client.
-	var upgradeRebootMode machineapi.UpgradeRequest_RebootMode
-	switch args.RebootMode {
-	case "powercycle":
-		upgradeRebootMode = machineapi.UpgradeRequest_POWERCYCLE
-	case "default", "":
-		upgradeRebootMode = machineapi.UpgradeRequest_DEFAULT
-	default:
-		return nil, nil, fmt.Errorf("unknown reboot_mode %q: must be 'default' or 'powercycle'", args.RebootMode)
-	}
-
-	ctx, err := talos.WithNodes(ctx, args.Nodes, h.AllowedNodes)
+	upgradeRebootMode, err := parseUpgradeRebootMode(args.RebootMode)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	// Upgrade path validation — skipped when TALOS_MCP_SKIP_VERSION_CHECK=true.
-	// Decision matrix:
-	//   image tag unparseable (custom/factory/latest) → warn + proceed
-	//   image parseable, node version unfetchable      → warn + proceed
-	//   image parseable, node version fetched, path ok → proceed silently
-	//   image parseable, node version fetched, invalid → hard error (reject)
-	if !h.SkipVersionCheck {
-		if len(args.Nodes) > 1 {
-			h.mcpLogWarn("talos_upgrade", "multiple nodes targeted; validating upgrade path against the first node only — upgrade nodes one at a time", fmt.Errorf("%d nodes", len(args.Nodes)))
-		}
+	targets, err := talos.CheckTargets(args.Nodes, h.AllowedNodes)
+	if err != nil {
+		return nil, nil, err
+	}
 
-		targetVer, parseErr := version.ExtractFromImage(args.Image)
-		if parseErr != nil {
-			h.mcpLogWarn("talos_upgrade", "could not parse version from image tag, skipping upgrade path validation", parseErr)
-		} else {
-			currentVer, fetchErr := h.Client.GetNodeVersion(ctx, args.Nodes[0])
-			if fetchErr != nil {
-				h.mcpLogWarn("talos_upgrade", "could not detect current node version, skipping upgrade path validation", fetchErr)
-			} else if pathErr := version.ValidateUpgradePath(*currentVer, targetVer); pathErr != nil {
-				return nil, nil, fmt.Errorf("upgrade refused: %w (set TALOS_MCP_SKIP_VERSION_CHECK=true to override)", pathErr)
-			}
-		}
+	if err := h.checkUpgradeVersion(ctx, args.Nodes, args.Image); err != nil {
+		return nil, nil, err
 	}
 
 	notifyProgress(ctx, req, "Initiating upgrade", 1, 2)
 
-	upgradeOpts := []talosclient.UpgradeOption{
-		talosclient.WithUpgradeImage(args.Image),
-		talosclient.WithUpgradePreserve(resolvePreserve(args.Preserve)),
-		talosclient.WithUpgradeStage(args.Stage),
-		talosclient.WithUpgradeForce(args.Force),
-		talosclient.WithUpgradeRebootMode(upgradeRebootMode),
+	upgradeReq := &machineapi.UpgradeRequest{
+		Image:      args.Image,
+		Preserve:   resolvePreserve(args.Preserve),
+		Stage:      args.Stage,
+		Force:      args.Force,
+		RebootMode: upgradeRebootMode,
 	}
 
-	resp, err := h.Client.UpgradeWithOptions(ctx, upgradeOpts...)
-	if err != nil {
+	rs, out := talos.FanOut(ctx, targets, func(c context.Context) (*machineapi.UpgradeResponse, error) {
+		return h.Client.UpgradeNodes(c, upgradeReq)
+	})
+	if _, err := out.FailClosed(); err != nil {
 		h.mcpLogError("talos_upgrade", err)
 		return nil, nil, fmt.Errorf("upgrade: %w", err)
 	}
@@ -424,7 +432,62 @@ func (h *Handlers) HandleUpgrade(ctx context.Context, req *mcp.CallToolRequest, 
 
 	notifyProgress(ctx, req, "Upgrade complete", 2, 2)
 
-	return jsonResult(resp)
+	return unaryResult(rs)
+}
+
+func parseUpgradeRebootMode(mode string) (machineapi.UpgradeRequest_RebootMode, error) {
+	switch mode {
+	case "powercycle":
+		return machineapi.UpgradeRequest_POWERCYCLE, nil
+	case "default", "":
+		return machineapi.UpgradeRequest_DEFAULT, nil
+	default:
+		return 0, fmt.Errorf("unknown reboot_mode %q: must be 'default' or 'powercycle'", mode)
+	}
+}
+
+func (h *Handlers) checkUpgradeVersion(ctx context.Context, nodes []string, image string) error {
+	if h.SkipVersionCheck {
+		return nil
+	}
+
+	if len(nodes) > 1 {
+		h.mcpLogWarn("talos_upgrade", "multiple nodes targeted; validating upgrade path against the first node only — upgrade nodes one at a time", fmt.Errorf("%d nodes", len(nodes)))
+	}
+
+	if err := h.checkUpgradePath(ctx, nodes[0], image); err != nil {
+		return fmt.Errorf("upgrade refused: %w (set TALOS_MCP_SKIP_VERSION_CHECK=true to override)", err)
+	}
+
+	return nil
+}
+
+// checkUpgradePath applies the rules the target installer enforces on the node,
+// which it checks only after draining the node and stopping its services.
+// An image tag without a version cannot be checked and passes with a warning.
+func (h *Handlers) checkUpgradePath(ctx context.Context, node, image string) error {
+	targetVer, err := version.ExtractFromImage(image)
+	if err != nil {
+		h.mcpLogWarn("talos_upgrade", "could not parse version from image tag, skipping upgrade path validation", err)
+		return nil
+	}
+
+	currentVer, err := h.Client.GetNodeVersion(ctx, node)
+	if err != nil {
+		return fmt.Errorf("could not detect the current Talos version of node %s: %w", node, err)
+	}
+
+	target, err := compatibility.ParseTalosVersion(&machineapi.VersionInfo{Tag: targetVer.String()})
+	if err != nil {
+		return fmt.Errorf("parse target version: %w", err)
+	}
+
+	host, err := compatibility.ParseTalosVersion(&machineapi.VersionInfo{Tag: currentVer.String()})
+	if err != nil {
+		return fmt.Errorf("parse node version: %w", err)
+	}
+
+	return target.UpgradeableFrom(host)
 }
 
 // RollbackArgs defines input for talos_rollback.
@@ -445,14 +508,17 @@ func (h *Handlers) HandleRollback(ctx context.Context, req *mcp.CallToolRequest,
 		return nil, nil, fmt.Errorf("rollback refused: nodes must be explicitly specified")
 	}
 
-	ctx, err := talos.WithNodes(ctx, args.Nodes, h.AllowedNodes)
+	targets, err := talos.CheckTargets(args.Nodes, h.AllowedNodes)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	notifyProgress(ctx, req, "Initiating rollback", 1, 2)
 
-	if err := h.Client.Rollback(ctx); err != nil {
+	_, out := talos.FanOut(ctx, targets, func(c context.Context) (struct{}, error) {
+		return struct{}{}, h.Client.Rollback(c)
+	})
+	if _, err := out.FailClosed(); err != nil {
 		h.mcpLogError("talos_rollback", err)
 		return nil, nil, fmt.Errorf("rollback: %w", err)
 	}
@@ -468,16 +534,89 @@ func (h *Handlers) HandleRollback(ctx context.Context, req *mcp.CallToolRequest,
 // PatchConfigArgs defines input for talos_patch_config.
 type PatchConfigArgs struct {
 	Patch   string   `json:"patch" jsonschema:"Machine config patch as a JSON or YAML string (strategic merge patch or RFC 6902 JSON Patch array). Must target a single node — the tool fetches the current config\\, merges the patch\\, and submits the result."`
-	Mode    string   `json:"mode,omitempty" jsonschema:"Apply mode: 'auto' (default)\\, 'reboot'\\, 'no_reboot'\\, 'staged'\\, or 'try'."`
+	Mode    string   `json:"mode,omitempty" jsonschema:"Apply mode: 'auto' (default)\\, 'no_reboot'\\, 'staged'\\, or 'try'. To restart the node after applying\\, use 'no_reboot' and then talos_reboot."`
 	DryRun  *bool    `json:"dry_run,omitempty" jsonschema:"Run in dry-run mode without applying changes. Defaults to true. Set explicitly to false to actually apply."`
-	Confirm bool     `json:"confirm" jsonschema:"REQUIRED when dry_run is false: Must be explicitly set to true to confirm applying the patch. Not required for dry-run mode."`
+	Confirm bool     `json:"confirm,omitempty" jsonschema:"REQUIRED when dry_run is false: Must be explicitly set to true to confirm applying the patch. Not required for dry-run mode."`
 	Nodes   []string `json:"nodes,omitempty" jsonschema:"Target node IP or hostname (exactly one). Omit to use the default node from talosconfig."`
 }
 
 // HandlePatchConfig implements the talos_patch_config tool.
 func (h *Handlers) HandlePatchConfig(ctx context.Context, req *mcp.CallToolRequest, args PatchConfigArgs) (*mcp.CallToolResult, any, error) {
-	// Log a redacted copy: the patch content may contain TLS keys, tokens, or registry passwords.
-	h.auditLog("talos_patch_config", struct {
+	h.auditLog("talos_patch_config", redactedPatchArgs(args), args.Nodes)
+
+	if len(args.Nodes) > 1 {
+		return nil, nil, fmt.Errorf("talos_patch_config requires exactly one target node (got %d); patch each node individually to ensure correct config merge", len(args.Nodes))
+	}
+
+	if !resolveDryRun(args.DryRun) && !args.Confirm {
+		return nil, nil, fmt.Errorf("patch_config refused: confirm must be explicitly set to true when dry_run is false")
+	}
+
+	if err := checkBlockedPaths([]byte(args.Patch), h.BlockedConfigPaths); err != nil {
+		return nil, nil, err
+	}
+
+	ctx, err := talos.WithSingleNode(ctx, args.Nodes, h.AllowedNodes)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	mode, err := talos.ParseApplyMode(args.Mode)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	patch, err := configpatcher.LoadPatch([]byte(args.Patch))
+	if err != nil {
+		return nil, nil, fmt.Errorf("load patch: %w", err)
+	}
+
+	resp, err := h.writePatchedConfig(ctx, req, patch, mode, resolveDryRun(args.DryRun))
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return jsonResult(resp)
+}
+
+func (h *Handlers) writePatchedConfig(ctx context.Context, req *mcp.CallToolRequest, patch configpatcher.Patch, mode machineapi.ApplyConfigurationRequest_Mode, dryRun bool) (*machineapi.ApplyConfigurationResponse, error) {
+	// Held from the config fetch through ApplyConfiguration, dry-run included: a write in between would be silently overwritten.
+	ctx, release, err := h.lockConfigWrite(ctx, "talos_patch_config")
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	applyMsg, doneMsg := applyProgressMessages(dryRun, false)
+
+	notifyProgress(ctx, req, "Fetching current machine config", 1, 3)
+
+	patched, err := h.patchedMachineConfig(ctx, patch)
+	if err != nil {
+		return nil, err
+	}
+
+	notifyProgress(ctx, req, applyMsg, 2, 3)
+
+	resp, err := h.Client.ApplyConfiguration(ctx, &machineapi.ApplyConfigurationRequest{
+		Data:   patched,
+		Mode:   mode,
+		DryRun: dryRun,
+	})
+	if err != nil {
+		_, wrapped := configWriteError(ctx, "talos_patch_config", dryRun, err)
+		h.mcpLogError("talos_patch_config", wrapped)
+		return nil, wrapped
+	}
+
+	notifyProgress(ctx, req, doneMsg, 3, 3)
+
+	return resp, nil
+}
+
+// redactedPatchArgs drops the patch content from the audit record: it may contain TLS keys, tokens, or registry passwords.
+func redactedPatchArgs(args PatchConfigArgs) any {
+	return struct {
 		Mode    string   `json:"mode,omitempty"`
 		DryRun  *bool    `json:"dry_run,omitempty"`
 		Confirm bool     `json:"confirm"`
@@ -489,86 +628,24 @@ func (h *Handlers) HandlePatchConfig(ctx context.Context, req *mcp.CallToolReque
 		Confirm: args.Confirm,
 		Nodes:   args.Nodes,
 		Patch:   fmt.Sprintf("<redacted, %d bytes>", len(args.Patch)),
-	}, args.Nodes)
-
-	// Require exactly one node: the fetch→merge path fetches the current config from
-	// the target node. Control-plane and worker nodes have different machine configs,
-	// so applying a config merged from node A to node B would be incorrect.
-	// Patch each node individually when multiple nodes need updating.
-	if len(args.Nodes) > 1 {
-		return nil, nil, fmt.Errorf("talos_patch_config requires exactly one target node (got %d); patch each node individually to ensure correct config merge", len(args.Nodes))
 	}
+}
 
-	// Confirm guard: require explicit confirmation for non-dry-run patches.
-	// Dry-run mode (the default) does not require confirmation.
-	if !resolveDryRun(args.DryRun) && !args.Confirm {
-		return nil, nil, fmt.Errorf("patch_config refused: confirm must be explicitly set to true when dry_run is false")
-	}
-
-	// Blocklist guard: reject patches that touch operator-restricted config paths.
-	// Applied before the network round-trip so misuse is caught cheaply.
-	if err := checkBlockedPaths([]byte(args.Patch), h.BlockedConfigPaths); err != nil {
-		return nil, nil, err
-	}
-
-	ctx, err := talos.WithNodes(ctx, args.Nodes, h.AllowedNodes)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	var mode machineapi.ApplyConfigurationRequest_Mode
-
-	switch args.Mode {
-	case "reboot":
-		mode = machineapi.ApplyConfigurationRequest_REBOOT
-	case "no_reboot":
-		mode = machineapi.ApplyConfigurationRequest_NO_REBOOT
-	case "staged":
-		mode = machineapi.ApplyConfigurationRequest_STAGED
-	case "try":
-		mode = machineapi.ApplyConfigurationRequest_TRY
-	case "auto", "":
-		mode = machineapi.ApplyConfigurationRequest_AUTO
+func applyProgressMessages(dryRun, maintenance bool) (apply, done string) {
+	switch {
+	case maintenance && dryRun:
+		return "Validating configuration (maintenance mode, dry run)", "Configuration validated (maintenance mode, dry run)"
+	case maintenance:
+		return "Applying configuration (maintenance mode)", "Configuration applied (maintenance mode)"
+	case dryRun:
+		return "Validating configuration (dry run)", "Configuration validated (dry run)"
 	default:
-		return nil, nil, fmt.Errorf("unknown mode %q: must be 'auto', 'reboot', 'no_reboot', 'staged', or 'try'", args.Mode)
+		return "Applying configuration", "Configuration applied"
 	}
+}
 
-	dryRun := resolveDryRun(args.DryRun)
-
-	applyMsg := "Applying configuration"
-	doneMsg := "Configuration applied"
-
-	if dryRun {
-		applyMsg = "Validating configuration (dry run)"
-		doneMsg = "Configuration validated (dry run)"
-	}
-
-	// Step 1: parse the patch (supports strategic merge patches and RFC 6902 JSON Patches).
-	patch, err := configpatcher.LoadPatch([]byte(args.Patch))
-	if err != nil {
-		return nil, nil, fmt.Errorf("load patch: %w", err)
-	}
-
-	// Acquire a per-node lock before the fetch→merge→apply sequence to prevent a
-	// read-modify-write race in HTTP multi-session mode. Without this, two concurrent
-	// sessions targeting the same node would both fetch the current config (v1), each
-	// merge their own patch, and the second apply would silently overwrite the first.
-	// The lock is held for the full duration of the operation and released on return.
-	// In dry-run mode the lock is still acquired: dry-run still reads live config and
-	// serialising it avoids confusing interleaved progress notifications.
-	nodeID := "<default>"
-	if len(args.Nodes) > 0 {
-		nodeID = args.Nodes[0]
-	}
-
-	mu := h.nodePatchMu(nodeID)
-	mu.Lock()
-	defer mu.Unlock()
-
-	notifyProgress(ctx, req, "Fetching current machine config", 1, 3)
-
-	// Step 2: fetch the current MachineConfig from the node via COSI.
-	// talos.WithNodes already set the single-node context, so COSI.Get uses one-to-one proxying.
+func (h *Handlers) patchedMachineConfig(ctx context.Context, patch configpatcher.Patch) ([]byte, error) {
+	// COSI Get needs the one-to-one proxying that WithSingleNode sets.
 	mc, err := h.Client.COSIState().Get(ctx, resource.NewMetadata(
 		talosconfig.NamespaceName,
 		talosconfig.MachineConfigType,
@@ -576,43 +653,27 @@ func (h *Handlers) HandlePatchConfig(ctx context.Context, req *mcp.CallToolReque
 		resource.VersionUndefined,
 	))
 	if err != nil {
-		return nil, nil, fmt.Errorf("get current machine config: %w", err)
+		err = fmt.Errorf("get current machine config: %w", err)
+		h.mcpLogError("talos_patch_config", err)
+		return nil, err
 	}
 
-	// Step 3: extract the raw YAML body from the COSI resource envelope.
 	body, err := extractMachineConfigBody(mc)
 	if err != nil {
-		return nil, nil, fmt.Errorf("extract machine config body: %w", err)
+		return nil, fmt.Errorf("extract machine config body: %w", err)
 	}
 
-	// Step 4: apply the patch to the current config.
 	cfg, err := configpatcher.Apply(configpatcher.WithBytes(body), []configpatcher.Patch{patch})
 	if err != nil {
-		return nil, nil, fmt.Errorf("apply patch: %w", err)
+		return nil, fmt.Errorf("apply patch: %w", err)
 	}
 
 	patched, err := cfg.Bytes()
 	if err != nil {
-		return nil, nil, fmt.Errorf("marshal patched config: %w", err)
+		return nil, fmt.Errorf("marshal patched config: %w", err)
 	}
 
-	notifyProgress(ctx, req, applyMsg, 2, 3)
-
-	applyReq := &machineapi.ApplyConfigurationRequest{
-		Data:   patched,
-		Mode:   mode,
-		DryRun: dryRun,
-	}
-
-	resp, err := h.Client.ApplyConfiguration(ctx, applyReq)
-	if err != nil {
-		h.mcpLogError("talos_patch_config", err)
-		return nil, nil, fmt.Errorf("apply configuration: %w", err)
-	}
-
-	notifyProgress(ctx, req, doneMsg, 3, 3)
-
-	return jsonResult(resp)
+	return patched, nil
 }
 
 // readConfigFile reads a machine config from a local file path.
@@ -656,9 +717,9 @@ func readConfigFile(path string) ([]byte, error) {
 // ApplyConfigArgs defines input for talos_apply_config.
 type ApplyConfigArgs struct {
 	ConfigFile      string   `json:"config_file" jsonschema:"Absolute path to a local machine config file (YAML or JSON). Must be absolute\\, no '..' components\\, regular file (symlinks are rejected)\\, max 1 MiB. The file is read server-side — secrets never enter the conversation context."`
-	Mode            string   `json:"mode,omitempty" jsonschema:"Apply mode: 'auto' (default)\\, 'reboot'\\, 'no_reboot'\\, 'staged'\\, or 'try'."`
+	Mode            string   `json:"mode,omitempty" jsonschema:"Apply mode: 'auto' (default)\\, 'no_reboot'\\, 'staged'\\, or 'try'. To restart the node after applying\\, use 'no_reboot' and then talos_reboot."`
 	DryRun          *bool    `json:"dry_run,omitempty" jsonschema:"Run in dry-run mode without applying changes. Defaults to true. Set explicitly to false to actually apply."`
-	Confirm         bool     `json:"confirm" jsonschema:"REQUIRED when dry_run is false: Must be explicitly set to true to confirm applying the config. Not required for dry-run mode."`
+	Confirm         bool     `json:"confirm,omitempty" jsonschema:"REQUIRED when dry_run is false: Must be explicitly set to true to confirm applying the config. Not required for dry-run mode."`
 	Nodes           []string `json:"nodes,omitempty" jsonschema:"Authenticated mode: target node IP or hostname (exactly one). Omit to use the default node from talosconfig. Mutually exclusive with endpoint."`
 	Insecure        bool     `json:"insecure,omitempty" jsonschema:"Maintenance-mode insecure connection (bypasses mTLS). Requires endpoint (bare IP) and TALOS_MCP_ENABLE_INSECURE=true. The transport is TLS-encrypted; server cert verified by cert_fingerprint if provided\\, otherwise accepted without verification."`
 	Endpoint        string   `json:"endpoint,omitempty" jsonschema:"Required when insecure=true: bare IPv4 or IPv6 address of the maintenance-mode node. No port\\, no scheme\\, no hostname. Ignored otherwise."`
@@ -667,11 +728,34 @@ type ApplyConfigArgs struct {
 
 // HandleApplyConfig implements the talos_apply_config tool.
 func (h *Handlers) HandleApplyConfig(ctx context.Context, req *mcp.CallToolRequest, args ApplyConfigArgs) (*mcp.CallToolResult, any, error) {
-	// AUDIT-FIRST: emit the audit log BEFORE any guard runs so refused-at-gate
-	// attempts still produce an audit trail. Paired with auditOutcome (deferred
-	// below) so defenders can distinguish refused / success / dial-error /
-	// rpc-error from the log alone.
-	h.auditLog("talos_apply_config", struct {
+	h.auditLog("talos_apply_config", applyConfigAuditArgs(args), args.Nodes)
+
+	var (
+		resp    *machineapi.ApplyConfigurationResponse
+		outcome string
+		err     error
+	)
+	defer func() { h.auditOutcome("talos_apply_config", outcome, err) }()
+
+	if err = fingerprintRequiresInsecure("talos_apply_config", args.CertFingerprint, args.Insecure); err != nil {
+		outcome = OutcomeRefusedFPWithoutInsec
+		return nil, nil, err
+	}
+
+	if args.Insecure {
+		resp, outcome, err = h.applyConfigInsecure(ctx, req, args)
+	} else {
+		resp, outcome, err = h.applyConfigAuthenticated(ctx, req, args)
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return jsonResult(resp)
+}
+
+func applyConfigAuditArgs(args ApplyConfigArgs) any {
+	return struct {
 		ConfigFile        string   `json:"config_file"`
 		Mode              string   `json:"mode,omitempty"`
 		DryRun            *bool    `json:"dry_run,omitempty"`
@@ -689,203 +773,103 @@ func (h *Handlers) HandleApplyConfig(ctx context.Context, req *mcp.CallToolReque
 		Insecure:          args.Insecure,
 		Endpoint:          args.Endpoint,
 		FingerprintPinned: args.CertFingerprint != "",
-	}, args.Nodes)
-
-	var (
-		outcome  = OutcomeOK
-		finalErr error
-	)
-	defer func() { h.auditOutcome("talos_apply_config", outcome, finalErr) }()
-
-	// Consistency check FIRST (before format / file I/O / blocklist):
-	// surface fingerprint-without-insecure cleanly.
-	if args.CertFingerprint != "" && !args.Insecure {
-		outcome = OutcomeRefusedFPWithoutInsec
-		finalErr = fmt.Errorf("apply_config refused: cert_fingerprint requires insecure=true")
-		return nil, nil, finalErr
 	}
+}
 
-	if args.Insecure {
-		return h.handleApplyConfigInsecure(ctx, req, args, &outcome, &finalErr)
-	}
-
-	// ── Authenticated (mTLS) path — pre-existing behaviour ─────────────────
-
-	// Blocklist guard: talos_apply_config replaces the entire machine config document,
-	// so it cannot be safely allowed when a path blocklist is active — any blocked path
-	// would be silently overwritten. Direct the caller to talos_patch_config instead,
-	// which supports targeted modifications that the blocklist can inspect.
+func (h *Handlers) applyConfigAuthenticated(ctx context.Context, req *mcp.CallToolRequest, args ApplyConfigArgs) (*machineapi.ApplyConfigurationResponse, string, error) {
+	// A full config replaces every blocked path, so path checks cannot make it safe.
 	if len(h.BlockedConfigPaths) > 0 {
-		outcome = OutcomeRefusedArgs
-		finalErr = fmt.Errorf("talos_apply_config is disabled while TALOS_MCP_BLOCKED_CONFIG_PATHS is set: use talos_patch_config for targeted changes that respect the blocklist")
-		return nil, nil, finalErr
+		return nil, OutcomeRefusedArgs, fmt.Errorf("talos_apply_config is disabled while TALOS_MCP_BLOCKED_CONFIG_PATHS is set: use talos_patch_config for targeted changes that respect the blocklist")
 	}
 
-	// Require exactly one node: each node has a unique machine config.
-	// Applying the same full config to multiple nodes risks overwriting node-specific settings
-	// (e.g. hostname, network interface names, node-specific certificates).
 	if len(args.Nodes) > 1 {
-		outcome = OutcomeRefusedArgs
-		finalErr = fmt.Errorf("talos_apply_config requires exactly one target node (got %d); apply each node individually", len(args.Nodes))
-		return nil, nil, finalErr
+		return nil, OutcomeRefusedArgs, fmt.Errorf("talos_apply_config requires exactly one target node (got %d); apply each node individually", len(args.Nodes))
 	}
 
-	// Confirm guard: require explicit confirmation for non-dry-run applies.
-	// Dry-run mode (the default) does not require confirmation.
 	if !resolveDryRun(args.DryRun) && !args.Confirm {
-		outcome = OutcomeRefusedConfirm
-		finalErr = fmt.Errorf("apply_config refused: confirm must be explicitly set to true when dry_run is false")
-		return nil, nil, finalErr
+		return nil, OutcomeRefusedConfirm, fmt.Errorf("apply_config refused: confirm must be explicitly set to true when dry_run is false")
 	}
 
-	var err error
-	ctx, err = talos.WithNodes(ctx, args.Nodes, h.AllowedNodes)
+	ctx, err := talos.WithSingleNode(ctx, args.Nodes, h.AllowedNodes)
 	if err != nil {
-		outcome = OutcomeRefusedAllowlist
-		finalErr = err
-		return nil, nil, finalErr
+		return nil, OutcomeRefusedAllowlist, err
 	}
 
-	// Read config file after all guard checks pass — guards are cheap structural
-	// validations; file I/O should not run until the call is authorized.
 	configData, err := readConfigFile(args.ConfigFile)
 	if err != nil {
-		outcome = OutcomeRefusedArgs
-		finalErr = err
-		return nil, nil, finalErr
+		return nil, OutcomeRefusedArgs, err
 	}
 
-	mode, err := parseApplyConfigMode(args.Mode)
+	mode, err := talos.ParseApplyMode(args.Mode)
 	if err != nil {
-		outcome = OutcomeRefusedArgs
-		finalErr = err
-		return nil, nil, finalErr
+		return nil, OutcomeRefusedArgs, err
 	}
 
 	dryRun := resolveDryRun(args.DryRun)
+	applyMsg, doneMsg := applyProgressMessages(dryRun, false)
 
-	// Acquire the same per-node lock used by HandlePatchConfig to prevent a
-	// PatchConfig-vs-ApplyConfig interleaving race: a concurrent PatchConfig
-	// could fetch the current config, then ApplyConfig replaces it, and
-	// PatchConfig would apply its patch against the now-stale base.
-	nodeID := "<default>"
-	if len(args.Nodes) > 0 {
-		nodeID = args.Nodes[0]
+	// Same lock as HandlePatchConfig: this apply would otherwise land between a patch's fetch and apply.
+	ctx, release, err := h.lockConfigWrite(ctx, "talos_apply_config")
+	if err != nil {
+		return nil, OutcomeRefusedWriteBusy, err
 	}
-
-	mu := h.nodePatchMu(nodeID)
-	mu.Lock()
-	defer mu.Unlock()
-
-	applyMsg := "Applying configuration"
-	doneMsg := "Configuration applied"
-
-	if dryRun {
-		applyMsg = "Validating configuration (dry run)"
-		doneMsg = "Configuration validated (dry run)"
-	}
+	defer release()
 
 	notifyProgress(ctx, req, applyMsg, 1, 2)
 
-	applyReq := &machineapi.ApplyConfigurationRequest{
+	resp, err := h.Client.ApplyConfiguration(ctx, &machineapi.ApplyConfigurationRequest{
 		Data:   configData,
 		Mode:   mode,
 		DryRun: dryRun,
-	}
-
-	resp, err := h.Client.ApplyConfiguration(ctx, applyReq)
+	})
 	if err != nil {
-		outcome = OutcomeRPCError
-		finalErr = fmt.Errorf("apply configuration: %w", err)
-		h.mcpLogError("talos_apply_config", err)
-		return nil, nil, finalErr
+		unknown, wrapped := configWriteError(ctx, "talos_apply_config", dryRun, err)
+		h.mcpLogError("talos_apply_config", wrapped)
+		if unknown {
+			return nil, OutcomeUnknown, wrapped
+		}
+		return nil, OutcomeRPCError, wrapped
 	}
 
 	notifyProgress(ctx, req, doneMsg, 2, 2)
 
-	return jsonResult(resp)
+	return resp, OutcomeOK, nil
 }
 
-// parseApplyConfigMode maps the public string mode to the protobuf enum.
-// Returns an error for unknown modes; empty string defaults to AUTO.
-func parseApplyConfigMode(mode string) (machineapi.ApplyConfigurationRequest_Mode, error) {
-	switch mode {
-	case "reboot":
-		return machineapi.ApplyConfigurationRequest_REBOOT, nil
-	case "no_reboot":
-		return machineapi.ApplyConfigurationRequest_NO_REBOOT, nil
-	case "staged":
-		return machineapi.ApplyConfigurationRequest_STAGED, nil
-	case "try":
-		return machineapi.ApplyConfigurationRequest_TRY, nil
-	case "auto", "":
-		return machineapi.ApplyConfigurationRequest_AUTO, nil
-	default:
-		return 0, fmt.Errorf("unknown mode %q: must be 'auto', 'reboot', 'no_reboot', 'staged', or 'try'", mode)
-	}
-}
-
-// handleApplyConfigInsecure executes talos_apply_config against a maintenance-
-// mode node via the insecure transport. The blocklist and cluster allowlist
-// gates do NOT apply: maintenance-mode bootstrap necessarily replaces the
-// entire config (there is no post-bootstrap state to protect) and the fresh
-// node is not in TALOS_MCP_ALLOWED_NODES (which gates the configured cluster).
-// The insecure allowlist (TALOS_MCP_INSECURE_ALLOWED_NODES) and bare-IP
-// canonical-form check substitute for those defences.
-func (h *Handlers) handleApplyConfigInsecure(ctx context.Context, req *mcp.CallToolRequest, args ApplyConfigArgs, outcome *string, finalErr *error) (*mcp.CallToolResult, any, error) {
+// applyConfigInsecure skips the config blocklist and the cluster allowlist; see .claude/rules/insecure-mode.md.
+func (h *Handlers) applyConfigInsecure(ctx context.Context, req *mcp.CallToolRequest, args ApplyConfigArgs) (*machineapi.ApplyConfigurationResponse, string, error) {
 	canonicalEndpoint, fp, gateOutcome, err := h.canonicalizeAndCheckInsecure(args.Endpoint, args.CertFingerprint, len(args.Nodes) > 0)
 	if err != nil {
-		*outcome = gateOutcome
-		*finalErr = err
-		return nil, nil, err
+		return nil, gateOutcome, err
 	}
 
-	// Confirm-vs-dry_run mirrors the authenticated path: confirm only required
-	// when dry_run=false. Maintenance-mode ApplyConfiguration honours DryRun
-	// per the talosctl source (verified against apply-config.go).
 	if !resolveDryRun(args.DryRun) && !args.Confirm {
-		*outcome = OutcomeRefusedConfirm
-		*finalErr = fmt.Errorf("apply_config refused: confirm must be explicitly set to true when dry_run is false (insecure mode)")
-		return nil, nil, *finalErr
+		return nil, OutcomeRefusedConfirm, fmt.Errorf("apply_config refused: confirm must be explicitly set to true when dry_run is false (insecure mode)")
 	}
 
 	configData, err := readConfigFile(args.ConfigFile)
 	if err != nil {
-		*outcome = OutcomeRefusedArgs
-		*finalErr = err
-		return nil, nil, err
+		return nil, OutcomeRefusedArgs, err
 	}
 
-	mode, err := parseApplyConfigMode(args.Mode)
+	mode, err := talos.ParseApplyMode(args.Mode)
 	if err != nil {
-		*outcome = OutcomeRefusedArgs
-		*finalErr = err
-		return nil, nil, err
+		return nil, OutcomeRefusedArgs, err
 	}
 
 	dryRun := resolveDryRun(args.DryRun)
+	applyMsg, doneMsg := applyProgressMessages(dryRun, true)
 
-	// Per-endpoint lock keyed on the canonical IP — different string forms
-	// (::ffff:1.2.3.4 vs 1.2.3.4) of the same physical address collapse to a
-	// single key so concurrent calls actually serialise.
-	mu := h.nodePatchMu("insecure:" + canonicalEndpoint)
+	mu := h.insecureApplyMu(canonicalEndpoint)
 	mu.Lock()
 	defer mu.Unlock()
 
-	applyMsg := "Applying configuration (maintenance mode)"
-	doneMsg := "Configuration applied (maintenance mode)"
-	if dryRun {
-		applyMsg = "Validating configuration (maintenance mode, dry run)"
-		doneMsg = "Configuration validated (maintenance mode, dry run)"
-	}
 	notifyProgress(ctx, req, applyMsg, 1, 2)
 
 	insecureClient, err := h.dialInsecure(ctx, canonicalEndpoint, fp)
 	if err != nil {
-		*outcome = OutcomeDialError
-		*finalErr = err
 		h.mcpLogError("talos_apply_config", err)
-		return nil, nil, err
+		return nil, OutcomeDialError, err
 	}
 	defer func() { _ = insecureClient.Close() }()
 
@@ -895,14 +879,13 @@ func (h *Handlers) handleApplyConfigInsecure(ctx context.Context, req *mcp.CallT
 		DryRun: dryRun,
 	})
 	if err != nil {
-		*outcome = OutcomeRPCError
-		*finalErr = fmt.Errorf("apply configuration (insecure): %w", err)
 		h.mcpLogError("talos_apply_config", err)
-		return nil, nil, *finalErr
+		return nil, OutcomeRPCError, fmt.Errorf("apply configuration (insecure): %w", err)
 	}
 
 	notifyProgress(ctx, req, doneMsg, 2, 2)
-	return jsonResult(resp)
+
+	return resp, OutcomeOK, nil
 }
 
 // ResetArgs defines input for talos_reset.
@@ -926,7 +909,7 @@ func (h *Handlers) HandleReset(ctx context.Context, req *mcp.CallToolRequest, ar
 		return nil, nil, fmt.Errorf("reset refused: nodes must be explicitly specified")
 	}
 
-	nodeCtx, err := talos.WithNodes(ctx, args.Nodes, h.AllowedNodes)
+	targets, err := talos.CheckTargets(args.Nodes, h.AllowedNodes)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -949,15 +932,17 @@ func (h *Handlers) HandleReset(ctx context.Context, req *mcp.CallToolRequest, ar
 
 	notifyProgress(ctx, req, "Initiating reset", 1, 2)
 
-	resp, err := h.Client.ResetGenericWithResponse(nodeCtx, resetReq)
-	if err != nil {
+	rs, out := talos.FanOut(ctx, targets, func(c context.Context) (*machineapi.ResetResponse, error) {
+		return h.Client.ResetGenericWithResponse(c, resetReq)
+	})
+	if _, err := out.FailClosed(); err != nil {
 		h.mcpLogError("talos_reset", err)
 		return nil, nil, fmt.Errorf("reset: %w", err)
 	}
 
 	notifyProgress(ctx, req, "Reset initiated", 2, 2)
 
-	return jsonResult(resp)
+	return unaryResult(rs)
 }
 
 // extractMachineConfigBody extracts the raw YAML config bytes from a MachineConfig COSI resource.

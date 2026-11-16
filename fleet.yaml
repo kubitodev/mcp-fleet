@@ -22,8 +22,8 @@ mcps:
   # ── needs an image (upstream ships none) → we build it ──
   - name: talos-mcp-server
     upstream: https://github.com/Nosmoht/talos-mcp-server
-    ref: v2.5.2
-    commit: "265e3f894ed6baf5da4286227754f24752354b5e"
+    ref: v4.0.0
+    commit: "33cb133a1f619ac945688ba8e28be5c60804b3db"
     build: true
     dockerfile: dockerfiles/talos-mcp-server.Dockerfile
   # ── first-party (source in-repo under mcps/, no upstream) → we build it ──
@@ -72,14 +72,14 @@ mcps:
     image: ghcr.io/argoproj-labs/mcp-for-argocd:v0.9.0
   - name: kubernetes-mcp-server
     upstream: https://github.com/containers/kubernetes-mcp-server
-    ref: v0.1.2
-    commit: "66553fed5c16454e5814b41e331b4357f15806d8"
+    ref: v0.1.3
+    commit: "fdf6a532f40556c5d14974950c4c90a1e565e7d5"
     build: false
     image: ghcr.io/containers/kubernetes-mcp-server:v0.0.66
   - name: mcp-victoriametrics
     upstream: https://github.com/VictoriaMetrics/mcp-victoriametrics
-    ref: v1.20.2
-    commit: "fb45b04fbb93bdeda4ea7117ea50420a5ad4cb7e"
+    ref: v1.21.0
+    commit: "f1e179843d4eda973c52b97bdfb170c2dc3a1cb0"
     build: false
     image: ghcr.io/victoriametrics/mcp-victoriametrics:v1.20.2
 # navidrome-mcp: add when needed (Blakeem/Navidrome-MCP)

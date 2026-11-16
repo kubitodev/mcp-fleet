@@ -2,15 +2,14 @@ package tools
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"io"
 	"time"
 
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	clusterapi "github.com/siderolabs/talos/pkg/machinery/api/cluster"
 	commonapi "github.com/siderolabs/talos/pkg/machinery/api/common"
+	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
 
 	"github.com/Nosmoht/talos-mcp-server/internal/talos"
 )
@@ -81,7 +80,39 @@ type VersionArgs struct {
 
 // HandleVersion implements the talos_version tool.
 func (h *Handlers) HandleVersion(ctx context.Context, _ *mcp.CallToolRequest, args VersionArgs) (*mcp.CallToolResult, any, error) {
-	h.auditLog("talos_version", struct {
+	h.auditLog("talos_version", versionAuditArgs(args), args.Nodes)
+
+	var (
+		outcome string
+		err     error
+	)
+	defer func() { h.auditOutcome("talos_version", outcome, err) }()
+
+	if err = fingerprintRequiresInsecure("talos_version", args.CertFingerprint, args.Insecure); err != nil {
+		outcome = OutcomeRefusedFPWithoutInsec
+		return nil, nil, err
+	}
+
+	ctx, cancel := withToolTimeout(ctx)
+	defer cancel()
+
+	if args.Insecure {
+		var resp *machineapi.VersionResponse
+		if resp, outcome, err = h.versionInsecure(ctx, args); err != nil {
+			return nil, nil, err
+		}
+		return jsonResult(resp)
+	}
+
+	var rs []talos.NodeResult[*machineapi.VersionResponse]
+	if rs, outcome, err = h.versionAuthenticated(ctx, args); err != nil {
+		return nil, nil, err
+	}
+	return unaryResult(rs)
+}
+
+func versionAuditArgs(args VersionArgs) any {
+	return struct {
 		Nodes             []string `json:"nodes,omitempty"`
 		Insecure          bool     `json:"insecure,omitempty"`
 		Endpoint          string   `json:"endpoint,omitempty"`
@@ -91,61 +122,43 @@ func (h *Handlers) HandleVersion(ctx context.Context, _ *mcp.CallToolRequest, ar
 		Insecure:          args.Insecure,
 		Endpoint:          args.Endpoint,
 		FingerprintPinned: args.CertFingerprint != "",
-	}, args.Nodes)
-
-	var (
-		outcome  = OutcomeOK
-		finalErr error
-	)
-	defer func() { h.auditOutcome("talos_version", outcome, finalErr) }()
-
-	if args.CertFingerprint != "" && !args.Insecure {
-		outcome = OutcomeRefusedFPWithoutInsec
-		finalErr = fmt.Errorf("talos_version refused: cert_fingerprint requires insecure=true")
-		return nil, nil, finalErr
 	}
+}
 
-	ctx, cancel := withToolTimeout(ctx)
-	defer cancel()
-
-	if args.Insecure {
-		canonicalEndpoint, fp, gateOutcome, err := h.canonicalizeAndCheckInsecure(args.Endpoint, args.CertFingerprint, len(args.Nodes) > 0)
-		if err != nil {
-			outcome = gateOutcome
-			finalErr = err
-			return nil, nil, err
-		}
-		client, err := h.dialInsecure(ctx, canonicalEndpoint, fp)
-		if err != nil {
-			outcome = OutcomeDialError
-			finalErr = err
-			return nil, nil, err
-		}
-		defer func() { _ = client.Close() }()
-		resp, err := client.Version(ctx)
-		if err != nil {
-			outcome = OutcomeRPCError
-			finalErr = fmt.Errorf("version (insecure): %w", err)
-			return nil, nil, finalErr
-		}
-		return jsonResult(resp)
-	}
-
-	ctx, err := talos.WithNodes(ctx, args.Nodes, h.AllowedNodes)
+func (h *Handlers) versionInsecure(ctx context.Context, args VersionArgs) (*machineapi.VersionResponse, string, error) {
+	canonicalEndpoint, fp, gateOutcome, err := h.canonicalizeAndCheckInsecure(args.Endpoint, args.CertFingerprint, len(args.Nodes) > 0)
 	if err != nil {
-		outcome = OutcomeRefusedAllowlist
-		finalErr = err
-		return nil, nil, err
+		return nil, gateOutcome, err
 	}
 
-	resp, err := h.Client.Version(ctx)
+	client, err := h.dialInsecure(ctx, canonicalEndpoint, fp)
 	if err != nil {
-		outcome = OutcomeRPCError
-		finalErr = fmt.Errorf("version: %w", err)
-		return nil, nil, finalErr
+		return nil, OutcomeDialError, err
+	}
+	defer func() { _ = client.Close() }()
+
+	resp, err := client.Version(ctx)
+	if err != nil {
+		return nil, OutcomeRPCError, fmt.Errorf("version (insecure): %w", err)
 	}
 
-	return jsonResult(resp)
+	return resp, OutcomeOK, nil
+}
+
+func (h *Handlers) versionAuthenticated(ctx context.Context, args VersionArgs) ([]talos.NodeResult[*machineapi.VersionResponse], string, error) {
+	targets, err := talos.CheckTargets(args.Nodes, h.AllowedNodes)
+	if err != nil {
+		return nil, OutcomeRefusedAllowlist, err
+	}
+
+	rs, out := talos.FanOut(ctx, targets, func(c context.Context) (*machineapi.VersionResponse, error) {
+		return h.Client.Version(c)
+	})
+	if _, err := out.FailClosed(); err != nil {
+		return nil, OutcomeRPCError, fmt.Errorf("version: %w", err)
+	}
+
+	return rs, OutcomeOK, nil
 }
 
 // HandleServices implements the talos_services tool.
@@ -153,17 +166,19 @@ func (h *Handlers) HandleServices(ctx context.Context, _ *mcp.CallToolRequest, a
 	ctx, cancel := withToolTimeout(ctx)
 	defer cancel()
 
-	ctx, err := talos.WithNodes(ctx, args.Nodes, h.AllowedNodes)
+	targets, err := talos.CheckTargets(args.Nodes, h.AllowedNodes)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	resp, err := h.Client.ServiceList(ctx)
-	if err != nil {
+	rs, out := talos.FanOut(ctx, targets, func(c context.Context) (*machineapi.ServiceListResponse, error) {
+		return h.Client.ServiceList(c)
+	})
+	if _, err := out.FailClosed(); err != nil {
 		return nil, nil, fmt.Errorf("service list: %w", err)
 	}
 
-	return jsonResult(resp)
+	return unaryResult(rs)
 }
 
 // HandleContainers implements the talos_containers tool.
@@ -171,7 +186,7 @@ func (h *Handlers) HandleContainers(ctx context.Context, _ *mcp.CallToolRequest,
 	ctx, cancel := withToolTimeout(ctx)
 	defer cancel()
 
-	ctx, err := talos.WithNodes(ctx, args.Nodes, h.AllowedNodes)
+	targets, err := talos.CheckTargets(args.Nodes, h.AllowedNodes)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -181,12 +196,14 @@ func (h *Handlers) HandleContainers(ctx context.Context, _ *mcp.CallToolRequest,
 		ns = defaultContainerNamespace
 	}
 
-	resp, err := h.Client.Containers(ctx, ns, commonapi.ContainerDriver_CONTAINERD)
-	if err != nil {
+	rs, out := talos.FanOut(ctx, targets, func(c context.Context) (*machineapi.ContainersResponse, error) {
+		return h.Client.Containers(c, ns, commonapi.ContainerDriver_CONTAINERD)
+	})
+	if _, err := out.FailClosed(); err != nil {
 		return nil, nil, fmt.Errorf("containers: %w", err)
 	}
 
-	return jsonResult(resp)
+	return unaryResult(rs)
 }
 
 // HandleProcesses implements the talos_processes tool.
@@ -194,17 +211,19 @@ func (h *Handlers) HandleProcesses(ctx context.Context, _ *mcp.CallToolRequest, 
 	ctx, cancel := withToolTimeout(ctx)
 	defer cancel()
 
-	ctx, err := talos.WithNodes(ctx, args.Nodes, h.AllowedNodes)
+	targets, err := talos.CheckTargets(args.Nodes, h.AllowedNodes)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	resp, err := h.Client.Processes(ctx)
-	if err != nil {
+	rs, out := talos.FanOut(ctx, targets, func(c context.Context) (*machineapi.ProcessesResponse, error) {
+		return h.Client.Processes(c)
+	})
+	if _, err := out.FailClosed(); err != nil {
 		return nil, nil, fmt.Errorf("processes: %w", err)
 	}
 
-	return jsonResult(resp)
+	return unaryResult(rs)
 }
 
 // HandleHealth implements the talos_health tool.
@@ -216,75 +235,75 @@ func (h *Handlers) HandleHealth(ctx context.Context, req *mcp.CallToolRequest, a
 		return nil, nil, fmt.Errorf("worker_nodes: %w", err)
 	}
 
-	ctx, err := talos.WithNodes(ctx, args.Nodes, h.AllowedNodes)
+	targets, err := talos.CheckTargets(args.Nodes, h.AllowedNodes)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	waitTimeout := defaultHealthWaitTimeout
-
-	if args.WaitTimeout != "" {
-		d, err := time.ParseDuration(args.WaitTimeout)
-		if err != nil {
-			return nil, nil, fmt.Errorf("parse wait_timeout %q: %w", args.WaitTimeout, err)
-		}
-
-		waitTimeout = d
-	}
-
-	var timeoutCtx context.Context
-
-	var cancel context.CancelFunc
-
-	timeoutCtx, cancel = context.WithTimeout(ctx, waitTimeout+defaultHealthWaitTimeoutBuffer)
-	defer cancel()
-
-	stream, err := h.Client.ClusterHealthCheck(timeoutCtx, waitTimeout, &clusterapi.ClusterInfo{
-		ControlPlaneNodes: args.ControlPlaneNodes,
-		WorkerNodes:       args.WorkerNodes,
-	})
+	waitTimeout, err := parseHealthWaitTimeout(args.WaitTimeout)
 	if err != nil {
-		return nil, nil, fmt.Errorf("health check: %w", err)
+		return nil, nil, err
 	}
+
+	timeoutCtx, cancel := context.WithTimeout(ctx, waitTimeout+defaultHealthWaitTimeoutBuffer)
+	defer cancel()
 
 	messages := []string{}
 
 	var i float64
 
-	var streamErr error
+	out := talos.StreamEach(timeoutCtx, targets,
+		func(c context.Context) (clusterapi.ClusterService_HealthCheckClient, error) {
+			return h.Client.ClusterHealthCheck(c, waitTimeout, &clusterapi.ClusterInfo{
+				ControlPlaneNodes: args.ControlPlaneNodes,
+				WorkerNodes:       args.WorkerNodes,
+			})
+		},
+		func(_ string, msg *clusterapi.HealthCheckProgress) bool {
+			i++
 
-	for {
-		msg, err := stream.Recv()
-		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				streamErr = err
+			progressMsg := msg.GetMessage()
+			if progressMsg == "" {
+				progressMsg = "checking cluster health"
 			}
 
-			break
-		}
+			notifyProgress(ctx, req, progressMsg, i, 0)
 
-		i++
+			if msg.GetMessage() != "" {
+				messages = append(messages, msg.GetMessage())
+			}
 
-		progressMsg := msg.GetMessage()
-		if progressMsg == "" {
-			progressMsg = "checking cluster health"
-		}
+			return false
+		},
+	)
 
-		notifyProgress(ctx, req, progressMsg, i, 0)
-
-		if msg.GetMessage() != "" {
-			messages = append(messages, msg.GetMessage())
-		}
+	openErr, streamErr := out.FailClosed()
+	if openErr != nil {
+		return nil, nil, fmt.Errorf("health check: %w", openErr)
 	}
 
 	// Propagate stream errors — this is the safety-critical path.
 	// A failed health check (e.g., etcd unhealthy, node not ready) arrives as
 	// a gRPC error from the final Recv(), not as io.EOF. Swallowing it would
 	// make HandleHealth always report success, undermining its role as a gate
-	// for upgrades and config patches.
+	// for upgrades and config patches. With several nodes any node's failure
+	// fails the call.
 	if streamErr != nil {
 		return nil, nil, fmt.Errorf("health check failed: %w", streamErr)
 	}
 
 	return jsonResult(healthResult{Messages: messages})
+}
+
+func parseHealthWaitTimeout(s string) (time.Duration, error) {
+	if s == "" {
+		return defaultHealthWaitTimeout, nil
+	}
+
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("parse wait_timeout %q: %w", s, err)
+	}
+
+	return d, nil
 }

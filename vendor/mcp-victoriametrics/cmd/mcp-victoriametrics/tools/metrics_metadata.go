@@ -38,12 +38,7 @@ func toolMetricsMetadata(c *config.Config) mcp.Tool {
 	if c.IsCluster() || c.IsCloud() {
 		options = append(
 			options,
-			mcp.WithString("tenant",
-				mcp.Title("Tenant name"),
-				mcp.Description("Name of the tenant for which the list of metrics will be displayed"),
-				mcp.DefaultString("0"),
-				mcp.Pattern(`^([0-9]+)(:[0-9]+)?$`),
-			),
+			withTenantParam("Name of the tenant for which the list of metrics will be displayed"),
 		)
 	}
 	options = append(
@@ -122,8 +117,8 @@ func toolMetricsMetadataHandler(ctx context.Context, cfg *config.Config, tcr mcp
 	// Get the response from the API
 	result := GetTextBodyForRequest(req, cfg)
 
-	// If no client-side filtering is needed, return the result as-is
-	if search == "" && metricType == "" && unit == "" {
+	// If no client-side filtering is needed or the request failed, return the result as-is
+	if result.IsError || (search == "" && metricType == "" && unit == "") {
 		return result, nil
 	}
 
@@ -224,7 +219,7 @@ func toolMetricsMetadataHandler(ctx context.Context, cfg *config.Config, tcr mcp
 	return mcp.NewToolResultText(string(filteredJSON)), nil
 }
 
-func RegisterToolMetricsMetadata(s *server.MCPServer, c *config.Config) {
+func registerToolMetricsMetadata(s *server.MCPServer, c *config.Config) {
 	if c.IsToolDisabled(toolNameMetricsMetadata) {
 		return
 	}
