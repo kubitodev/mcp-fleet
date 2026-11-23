@@ -22,8 +22,8 @@ mcps:
   # ── needs an image (upstream ships none) → we build it ──
   - name: talos-mcp-server
     upstream: https://github.com/Nosmoht/talos-mcp-server
-    ref: v4.0.0
-    commit: "33cb133a1f619ac945688ba8e28be5c60804b3db"
+    ref: v4.0.1
+    commit: "668bd721ac0de779209ade6066eea3646d3fe871"
     build: true
     dockerfile: dockerfiles/talos-mcp-server.Dockerfile
   # ── first-party (source in-repo under mcps/, no upstream) → we build it ──
